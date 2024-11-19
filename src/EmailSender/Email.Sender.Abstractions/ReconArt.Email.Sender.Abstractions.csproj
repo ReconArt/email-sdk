@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+	<PropertyGroup>
+		<TargetFrameworks>net9.0;net8.0;</TargetFrameworks>
+		<Nullable>enable</Nullable>
+		<PackageId>ReconArt.Email.Sender.Abstractions</PackageId>
+		<Description>Provides abstractions for sending emails using the SMTP protocol.</Description>
+		<Copyright>Copyright © ReconArt, Inc. 2008-2024</Copyright>
+		<Authors>ReconArt, Inc.</Authors>
+		<Company>ReconArt, Inc.</Company>
+		<PackageVersion>1.0.0</PackageVersion>
+		<GeneratePackageOnBuild>false</GeneratePackageOnBuild>
+		<RepositoryUrl>https://github.com/ReconArt/email-sdk</RepositoryUrl>
+		<PublishRepositoryUrl>true</PublishRepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+		<PackageTags>ReconArt Email Send Sender Abstractions</PackageTags>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+	</PropertyGroup>
+
+	<ItemGroup>
+		<None Include="README.md" Pack="true" PackagePath="\" />
+	</ItemGroup>
+
+</Project>
