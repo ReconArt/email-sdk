@@ -86,7 +86,7 @@ public class Startup
 
 In this setup, the `AddEmailSenderService` extension method is used to register the `EmailSenderService` with the ASP.NET Core dependency injection system. This method allows you to optionally load options from a configuration source, such as appsettings.json, and optionally override them with a delegate if needed.
 
-The method can be called without providing any arguments. In such case, an instance of `EmailSenderServiceOptions` with the default values will be used.
+The method can be called without providing any arguments. In such case, an instance of `EmailSenderOptions` with the default values will be used.
 
 ### Health Monitoring
 
@@ -180,7 +180,7 @@ For more detailed insights into what each option does, refer to their XML docume
 | OnEmailSendingFailure           | Func<IEmailMessage, EmailFailureReason, ValueTask>? | Called when there's a failure sending an email to the SMTP server.                                                                                                                                                               | null          |
 
 
-`OnEmailSendingFailure` will not be invoked if cancellation is requested. Additionally, unless `SignalFailureOnInvalidParameters` is set to `true`, it will not be called for failures occurring during the construction of the MIME message. These failures can be inspected through the return values of `IEmailSenderService.TrySendAsync` and `IEmailSenderService.TryScheduleAsync`.
+`OnEmailSendingFailure` will not be invoked if cancellation is requested. Additionally, unless `SignalFailureOnInvalidParameters` is set to `true`, it will not be called for failures during the construction of the MIME message. These failures can be inspected through the return values of `IEmailSenderService.TrySendAsync` and `IEmailSenderService.TryScheduleAsync`.
 
 #### EmailSenderLivenessService Configuration Options
 
@@ -202,10 +202,6 @@ If you'd like to contribute to the project, please reach out to the [ReconArt/em
 ## Support
 
 If you encounter any issues or require assistance, please file an issue in the [GitHub Issues](https://github.com/ReconArt/email-sdk/issues) section of the repository.
-
-## License
-
-Copyright © ReconArt, Inc. All rights reserved.
 
 ## Authors and Acknowledgments
 
