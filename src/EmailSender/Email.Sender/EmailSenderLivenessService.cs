@@ -42,7 +42,7 @@ namespace ReconArt.Email
         /// Constructs a new instance of <see cref="EmailSenderLivenessService"/>.
         /// </summary>
         public EmailSenderLivenessService(IEmailSenderService emailService, EmailSenderLivenessOptions options, Action<ILoggingBuilder>? configureLogger = null) 
-            : this(emailService, Helpers.CreateOptionsMonitor(options), Helpers.CreateLogger<EmailSenderLivenessService>(configureLogger))
+            : this(emailService, StaticOptionsMonitor.Create(options), InternalLoggerFactory.CreateLogger<EmailSenderLivenessService>(configureLogger))
         {
         }
 

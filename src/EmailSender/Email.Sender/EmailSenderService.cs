@@ -85,7 +85,7 @@ namespace ReconArt.Email
         /// Leave <see langword="null"/> to effectively disable logging.
         /// </param>
         public EmailSenderService(EmailSenderOptions mailOptions, Action<ILoggingBuilder>? configureLogger = null)
-            : this(TransformEmailSenderOptions(mailOptions), Helpers.CreateLogger<EmailSenderService>(configureLogger))
+            : this(TransformEmailSenderOptions(mailOptions), InternalLoggerFactory.CreateLogger<EmailSenderService>(configureLogger))
         {
         }
 
@@ -397,40 +397,46 @@ namespace ReconArt.Email
 
                 MailboxAddress? fromAddress = null;
                 MailboxAddress? senderAddress = null;
-                if (mailOptions.RequiresAuthentication)
-                {
-                    if (mailOptions.IsUsernameEmailAddress)
-                    {
-                        if (mailOptions.FromAddress is not null && mailOptions.FromAddress != mailOptions.Username)
-                        {
-                            if (!MailboxAddress.TryParse(_cachedAddressParserOptions, mailOptions.FromAddress, out fromAddress))
-                            {
-                                _logger.LogCritical("Failed to parse {FromAddress} as an email address for the \"From\" header.", mailOptions.FromAddress);
-                                return null;
-                            }
 
-                            if (!MailboxAddress.TryParse(_cachedAddressParserOptions, mailOptions.Username, out senderAddress))
-                            {
-                                _logger.LogCritical("Failed to parse {Username} as an email address for the \"Sender\" header.", mailOptions.Username);
-                                return null;
-                            }
-                        }
-                        else if (!MailboxAddress.TryParse(_cachedAddressParserOptions, mailOptions.Username, out fromAddress))
+                if (mailOptions.RequiresAuthentication && mailOptions.IsUsernameEmailAddress)
+                {
+                    // Defensive check. Under normal conditions should never be hit.
+                    if (string.IsNullOrWhiteSpace(mailOptions.Username))
+                    {
+                        _logger.LogCritical("Malformed configuration! Username is required when authentication is enabled, but was missing.");
+                        return null;
+                    }
+
+                    if (mailOptions.FromAddress is not null && mailOptions.FromAddress != mailOptions.Username)
+                    {
+                        if (!TryParseEmailAddress(mailOptions.FromAddress, "From", out fromAddress))
                         {
-                            _logger.LogCritical("Failed to parse {Username} as an email address for the \"From\" header.", mailOptions.Username);
+                            return null;
+                        }
+                        if (!TryParseEmailAddress(mailOptions.Username, "Sender", out senderAddress))
+                        {
                             return null;
                         }
                     }
-                    else if (!MailboxAddress.TryParse(_cachedAddressParserOptions, mailOptions.FromAddress, out fromAddress))
+                    else if (!TryParseEmailAddress(mailOptions.Username, "From", out fromAddress))
                     {
-                        _logger.LogCritical("Failed to parse {FromAddress} as an email address for the \"From\" header.", mailOptions.FromAddress);
                         return null;
                     }
                 }
-                else if (!MailboxAddress.TryParse(_cachedAddressParserOptions, mailOptions.FromAddress, out fromAddress))
+                else
                 {
-                    _logger.LogCritical("Failed to parse {FromAddress} as an email address for the \"From\" header.", mailOptions.FromAddress);
-                    return null;
+                    // Defensive check. Under normal conditions should never be hit.
+                    if (string.IsNullOrWhiteSpace(mailOptions.FromAddress))
+                    {
+                        _logger.LogCritical("Malformed configuration! " +
+                            "From address is required when no authentication is necessary, or when the username used is not an email address.");
+                        return null;
+                    }
+
+                    if (!TryParseEmailAddress(mailOptions.FromAddress, "From", out fromAddress))
+                    {
+                        return null;
+                    }
                 }
 
                 mail.From.Add(fromAddress);
@@ -572,6 +578,17 @@ namespace ReconArt.Email
                 ? await OnEmailSendingFailureAsync(mailMessage, mailOptions, EmailFailureReason.Disposed).ConfigureAwait(false)
                 : await SendMessageAsync(mimeMessage, mailMessage, mailOptions, cancellationToken).ConfigureAwait(false);
         }
+
+        private bool TryParseEmailAddress(string address, string headerType, out MailboxAddress parsedAddress)
+        {
+            if (!MailboxAddress.TryParse(_cachedAddressParserOptions, address, out parsedAddress))
+            {
+                _logger.LogCritical("Failed to parse {Address} as an email address for the \"{HeaderType}\" header.", address, headerType);
+                return false;
+            }
+            return true;
+        }
+
 
         private EmailSenderOptions? GetOptions()
         {
@@ -776,7 +793,7 @@ namespace ReconArt.Email
         private static IOptionsMonitor<EmailSenderOptions> TransformEmailSenderOptions(EmailSenderOptions options)
         {
             ObjectValidator.ValidateObjectOrThrow(options);
-            return Helpers.CreateOptionsMonitor(options);
+            return StaticOptionsMonitor.Create(options);
         }
 
         [GeneratedRegex(@"(\+|\.|\-)[0-9]+\@")]

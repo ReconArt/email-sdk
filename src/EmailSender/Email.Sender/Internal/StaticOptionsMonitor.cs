@@ -3,10 +3,25 @@ using System;
 
 namespace ReconArt.Email.Sender.Internal
 {
+
+    internal static class StaticOptionsMonitor
+    {
+        internal static IOptionsMonitor<TOptions> Create<TOptions>(TOptions options)
+            where TOptions : class
+        {
+            return new StaticOptionsMonitor<TOptions>(options);
+        }
+    }
+
     internal class StaticOptionsMonitor<TOptions> : IOptionsMonitor<TOptions> 
         where TOptions: class
     {
         private readonly IOptions<TOptions> _options;
+
+        public StaticOptionsMonitor(TOptions options)
+            : this(Options.Create(options))
+        {
+        }
 
         public StaticOptionsMonitor(IOptions<TOptions> options)
         {
