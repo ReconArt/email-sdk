@@ -7,7 +7,6 @@ using MimeKit;
 using MimeKit.Utils;
 using Polly.Contrib.WaitAndRetry;
 using ReconArt.Email.Sender.Internal;
-using ReconArt.Synchronization;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -34,15 +33,16 @@ namespace ReconArt.Email
         private const string INVALID_ADDRESS = "5.1.3 Invalid address";
         private const string SENDER_DENIED = "5.2.252 SendAsDenied";
 
-        private readonly SmtpClient _smtpClient = new();
+        private readonly SmtpClient[] _connections;
+        private readonly int[] _connectionStatus; // 0=available, 1=in-use
+
         private readonly ILogger<EmailSenderService> _logger;
         private readonly IOptionsMonitor<EmailSenderOptions> _mailOptions;
-        private readonly UnitDistributorSlim _workDistributor = new(1);
-        private readonly ActionBlock<(MimeMessage, IEmailMessage)> _emailScheduleWork;
+        private readonly ActionBlock<QueuedMail> _emailScheduleWork;
         private readonly IDisposable? _optionsUpdateListener; 
 
         private ParserOptions _cachedAddressParserOptions;
-        private int _failedMessagesCount = 0;
+        private int _failedMessagesCount;
         private bool _disposed;
 
         /// <summary>
@@ -54,16 +54,31 @@ namespace ReconArt.Email
         {
             _mailOptions = mailOptions;
             _logger = logger;
-            _smtpClient.ServerCertificateValidationCallback = (s, c, h, e) => true;
-            _emailScheduleWork = new ActionBlock<(MimeMessage, IEmailMessage)>(ProcessScheduledMessageAsync, new ExecutionDataflowBlockOptions
+
+            EmailSenderOptions options = mailOptions.CurrentValue;
+            _emailScheduleWork = new ActionBlock<QueuedMail>(ProcessMessageAsync, new ExecutionDataflowBlockOptions
             {
-                // DO NOT CHANGE THESE! Settings below are needed to achieve thread-safety and order.
-                EnsureOrdered = true,
-                MaxDegreeOfParallelism = 1,
+                EnsureOrdered = false,
+                MaxDegreeOfParallelism = Math.Max(options.MaxConcurrentConnections, 1),
                 SingleProducerConstrained = false,
                 TaskScheduler = TaskScheduler.Default,
                 BoundedCapacity = 10_000
             });
+
+            SmtpClient[] connections = new SmtpClient[options.MaxConcurrentConnections];
+            for (int i = 0; i < connections.Length; i++)
+            {
+                SmtpClient client = new();
+                if (options.ServerCertificateValidationCallback is not null)
+                {
+                    client.ServerCertificateValidationCallback = options.ServerCertificateValidationCallback;
+                }
+
+                connections[i] = client;
+            }
+
+            _connections = connections;
+            _connectionStatus = new int[connections.Length];
 
             try
             {
@@ -92,72 +107,12 @@ namespace ReconArt.Email
         #region Public_Methods
 
         /// <inheritdoc/>
-        public ValueTask<bool> TrySendAsync(IEmailMessage email, CancellationToken cancellationToken = default)
-        {
-            if (cancellationToken.IsCancellationRequested)
-            {
-                email.Dispose();
-                cancellationToken.ThrowIfCancellationRequested();
-            }
-
-            EmailSenderOptions? mailOptions = GetOptions();
-            if (mailOptions is null)
-            {
-                Interlocked.Increment(ref _failedMessagesCount);
-                email.Dispose();
-                return new ValueTask<bool>(false);
-            }
-
-            MimeMessage? mail = CreateMimeMessage(email, mailOptions, out bool treatAsSuccess);
-            return mail is null
-                ? HandleMimeMessageResponseAsync(email, mailOptions, treatAsSuccess)
-                : ProcessSendAsync(mail, email, cancellationToken);
-        }
+        public ValueTask<bool> TrySendAsync(IEmailMessage email, CancellationToken cancellationToken = default) =>
+            InternalTryScheduleAsync(email, true, cancellationToken);
 
         /// <inheritdoc/>
-        public ValueTask<bool> TryScheduleAsync(IEmailMessage email, CancellationToken cancellationToken = default)
-        {
-            if (cancellationToken.IsCancellationRequested)
-            {
-                email.Dispose();
-                cancellationToken.ThrowIfCancellationRequested();
-            }
-
-            EmailSenderOptions? mailOptions = GetOptions();
-            if (mailOptions is null)
-            {
-                Interlocked.Increment(ref _failedMessagesCount);
-                email.Dispose();
-                return new ValueTask<bool>(false);
-            }
-
-            MimeMessage? mail = CreateMimeMessage(email, mailOptions, out bool treatAsSuccess);
-            if (mail is null)
-            {
-                return HandleMimeMessageResponseAsync(email, mailOptions, treatAsSuccess);
-            }
-
-            Task<bool> sendTask = _emailScheduleWork.SendAsync((mail, email), cancellationToken);
-            if (sendTask.IsCompleted)
-            {
-                if (sendTask.IsCanceled)
-                {
-                    email.Dispose();
-                    cancellationToken.ThrowIfCancellationRequested();
-                }
-                else if (!sendTask.Result)
-                {
-                    _logger.LogError("Email message could not be processed. Either we have hit the limit of the queue, or it has stopped accepting new email messages.");
-                    return OnEmailSendingFailureAsync(email, mailOptions, EmailFailureReason.Unknown);
-                }
-            }
-
-            _logger.LogInformation("Email to {Recipients} has been scheduled for sending.", 
-                string.Join(", ", string.Join(", ",
-                    mail.To.Cast<MailboxAddress>().Select(static adr => adr.Address))));
-
-            return new ValueTask<bool>(true);
-        }
+        public ValueTask<bool> TryScheduleAsync(IEmailMessage email, CancellationToken cancellationToken = default) =>
+            InternalTryScheduleAsync(email, false, cancellationToken);
 
         /// <inheritdoc/>
         public async ValueTask<Exception?> TestConnectionAsync(CancellationToken cancellationToken = default)
@@ -236,8 +191,13 @@ namespace ReconArt.Email
                 _emailScheduleWork.Complete();
                 await _emailScheduleWork.Completion.ConfigureAwait(false);
 
-                await _smtpClient.DisconnectAsync(true).ConfigureAwait(false);
-                _smtpClient.Dispose();
+                for (int i = 0; i < _connections.Length; i++)
+                {
+                    SmtpClient smtpClient = _connections[i];
+
+                    await smtpClient.DisconnectAsync(true).ConfigureAwait(false);
+                    smtpClient.Dispose();
+                }
             }
             catch (Exception ex)
             {
@@ -253,14 +213,102 @@ namespace ReconArt.Email
 
         #region Private_Methods
 
+        private ValueTask<bool> InternalTryScheduleAsync(IEmailMessage email, bool awaitCompletion, CancellationToken cancellationToken)
+        {
+            if (cancellationToken.IsCancellationRequested)
+            {
+                email.Dispose();
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            EmailSenderOptions? mailOptions = GetOptions();
+            if (mailOptions is null)
+            {
+                Interlocked.Increment(ref _failedMessagesCount);
+                email.Dispose();
+                return new ValueTask<bool>(false);
+            }
+
+            MimeMessage? mimeMessage = CreateMimeMessage(email, mailOptions, out bool treatAsSuccess);
+            if (mimeMessage is null)
+            {
+                return HandleMimeMessageResponseAsync(email, mailOptions, treatAsSuccess);
+            }
+
+            QueuedMail queuedMail = new(mimeMessage, email,
+                awaitCompletion
+                    ? new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
+                    : null, cancellationToken);
+
+            Task<bool> sendTask = _emailScheduleWork.SendAsync(queuedMail, cancellationToken);
+
+            if (sendTask.IsCompleted)
+            {
+                if (sendTask.IsCanceled)
+                {
+                    queuedMail.Dispose();
+                    cancellationToken.ThrowIfCancellationRequested();
+                }
+                else if (!sendTask.Result)
+                {
+                    _logger.LogError("Email message could not be processed. " +
+                        "Either we have hit the limit of the queue, or it has stopped accepting new email messages.");
+
+                    Task<bool> eventTask = OnEmailSendingFailureAsync(email, mailOptions, EmailFailureReason.Unknown).AsTask();
+                    _ = eventTask.ContinueWith(DisposeQueuedMail, queuedMail, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
+                    return new ValueTask<bool>(eventTask);
+                }
+            }
+            else
+            {
+                // Make sure we clean up any resources if the task is never consumed and also log the occurrence.
+                _ = sendTask.ContinueWith(HandleBufferredQueuedMail, queuedMail, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+            }
+
+                _logger.LogInformation("Email to {Recipients} has been scheduled for sending.",
+                    string.Join(", ", string.Join(", ",
+                        mimeMessage.To.Cast<MailboxAddress>().Select(static adr => adr.Address))));
+
+            return awaitCompletion
+                ? new ValueTask<bool>(queuedMail.TaskCompletionSource!.Task)
+                : new ValueTask<bool>(true);
+        }
+
+        private async Task HandleBufferredQueuedMail(Task<bool> sendTask, object? state)
+        {
+            Tuple<QueuedMail, EmailSenderOptions> context = (Tuple<QueuedMail, EmailSenderOptions>)state!;
+            QueuedMail queuedMail = context.Item1;
+            EmailSenderOptions mailOptions = context.Item2;
+
+            if (!sendTask.IsCompletedSuccessfully)
+            {
+                queuedMail.Dispose();
+            }
+            else
+            {
+                if (!sendTask.Result)
+                {
+                    _logger.LogError("Email message could not be processed. " +
+                        "Either we have hit the limit of the queue, or it has stopped accepting new email messages.");
+
+                    await OnEmailSendingFailureAsync(queuedMail.Message, mailOptions, EmailFailureReason.Unknown);
+                    queuedMail.Dispose();
+                }
+            }
+        }
+
         private ValueTask<bool> HandleMimeMessageResponseAsync(IEmailMessage email, EmailSenderOptions mailOptions, bool treatAsSuccess)
         {
             if (!treatAsSuccess && mailOptions.SignalFailureOnInvalidParameters)
             {
                 return OnEmailSendingFailureAsync(email, mailOptions, EmailFailureReason.InvalidParameters);
             }
+            else
+            {
+                email.Dispose();
+            }
 
-            email.Dispose();
             return new ValueTask<bool>(treatAsSuccess);
         }
 
@@ -481,19 +529,19 @@ namespace ReconArt.Email
             }
         }
 
-        private async ValueTask<bool> TryToConnectAndAuthenticateSmtpClientAsync(EmailSenderOptions options, CancellationToken cancellationToken)
+        private async ValueTask<bool> TryToConnectAndAuthenticateSmtpClientAsync(EmailSenderOptions options, CancellationToken cancellationToken, SmtpClient smtpClient)
         {
             try
             {
-                if (!_smtpClient.IsConnected)
+                if (!smtpClient.IsConnected)
                 {
-                    await _smtpClient.ConnectAsync(options.Host, options.Port, SecureSocketOptions.StartTls, cancellationToken: cancellationToken)
+                    await smtpClient.ConnectAsync(options.Host, options.Port, SecureSocketOptions.StartTls, cancellationToken: cancellationToken)
                         .ConfigureAwait(false);
                 }
 
-                if (options.RequiresAuthentication && !_smtpClient.IsAuthenticated)
+                if (options.RequiresAuthentication && !smtpClient.IsAuthenticated)
                 {
-                    await _smtpClient.AuthenticateAsync(options.Username ?? string.Empty, options.Password ?? string.Empty, cancellationToken)
+                    await smtpClient.AuthenticateAsync(options.Username ?? string.Empty, options.Password ?? string.Empty, cancellationToken)
                         .ConfigureAwait(false);
                 }
             }
@@ -511,72 +559,59 @@ namespace ReconArt.Email
             return true;
         }
 
-        private async Task ProcessScheduledMessageAsync((MimeMessage MimeMessage, IEmailMessage MailMessage) context)
+        private async Task<bool> ProcessMessageAsync(QueuedMail queuedMail)
         {
-            await _workDistributor.TryTakeAsync(1, 1).ConfigureAwait(false);
             try
             {
-                await ProcessMessageAsync(context.MimeMessage, context.MailMessage, default)
-                    .ConfigureAwait(false);
-            }
-            finally
-            {
-                _workDistributor.Return(1);
-            }
-        }
-
-        private async ValueTask<bool> ProcessSendAsync(MimeMessage mimeMessage, IEmailMessage mailMessage, CancellationToken cancellationToken)
-        {
-            await _workDistributor.TryTakeAsync(1, 0, cancellationToken).ConfigureAwait(false);
-            try
-            {
-                return await ProcessMessageAsync(mimeMessage, mailMessage, cancellationToken).ConfigureAwait(false);
-            }
-            finally
-            {
-                _workDistributor.Return(1);
-            }
-        }
-
-        private async Task<bool> ProcessMessageAsync(MimeMessage mimeMessage, IEmailMessage mailMessage, CancellationToken cancellationToken)
-        {
-            bool wasDisposed = false;
-            EmailSenderOptions? mailOptions;
-            _logger.LogInformation("Message for {Recipients} is being processed...", string.Join(", ",
-                    mimeMessage.To.Cast<MailboxAddress>().Select(static adr => adr.Address)));
-            mailOptions = GetOptions();
-            if (mailOptions is null)
-            {
-                Interlocked.Increment(ref _failedMessagesCount);
-                mailMessage.Dispose();
-                return false;
-            }
-
-            try
-            {
-                if (_smtpClient.IsConnected)
+                bool wasDisposed = false;
+                EmailSenderOptions? mailOptions;
+                _logger.LogInformation("Message for {Recipients} is being processed...", string.Join(", ",
+                        queuedMail.MimeMessage.To.Cast<MailboxAddress>().Select(static adr => adr.Address)));
+                mailOptions = GetOptions();
+                if (mailOptions is null)
                 {
-                    await _smtpClient.NoOpAsync(cancellationToken).ConfigureAwait(false);
+                    Interlocked.Increment(ref _failedMessagesCount);
+                    return false;
+                }
+
+                (SmtpClient smtpClient, int connectionIndex) = GetConnection();
+                try
+                {
+                    try
+                    {
+                        if (smtpClient.IsConnected)
+                        {
+                            await smtpClient.NoOpAsync(queuedMail.CancellationToken).ConfigureAwait(false);
+                        }
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        _logger.LogError("Could not send message to SMTP server - object was disposed.");
+                        wasDisposed = true;
+                    }
+                    catch (OperationCanceledException) when (LogOperationCancelledWithoutUnwinding(_logger))
+                    {
+                        // Honor typical async patterns, by keeping cancellation as an exception.
+                        throw;
+                    }
+                    catch
+                    {
+                        _logger.LogInformation("Failed to keep the underlying connection alive. Will re-connect and re-authenticate where appropriate.");
+                    }
+
+                    return wasDisposed
+                        ? await OnEmailSendingFailureAsync(queuedMail.Message, mailOptions, EmailFailureReason.Disposed).ConfigureAwait(false)
+                        : await SendMessageAsync(smtpClient, queuedMail, mailOptions).ConfigureAwait(false);
+                }
+                finally
+                {
+                    ReleaseConnection(connectionIndex);
                 }
             }
-            catch (ObjectDisposedException)
+            finally
             {
-                _logger.LogError("Could not send message to SMTP server - object was disposed.");
-                wasDisposed = true;
+                queuedMail.Dispose();
             }
-            catch (OperationCanceledException) when (ExceptionFilters.DisposeWithoutUnwindingStack(mailMessage) & LogOperationCancelledWithoutUnwinding(_logger))
-            {
-                // Honor typical async patterns, by keeping cancellation as an exception.
-                throw;
-            }
-            catch
-            {
-                _logger.LogInformation("Failed to keep the underlying connection alive. Will re-connect and re-authenticate where appropriate.");
-            }
-
-            return wasDisposed
-                ? await OnEmailSendingFailureAsync(mailMessage, mailOptions, EmailFailureReason.Disposed).ConfigureAwait(false)
-                : await SendMessageAsync(mimeMessage, mailMessage, mailOptions, cancellationToken).ConfigureAwait(false);
         }
 
         private bool TryParseEmailAddress(string address, string headerType, out MailboxAddress parsedAddress)
@@ -589,6 +624,30 @@ namespace ReconArt.Email
             return true;
         }
 
+        private (SmtpClient Client, int Index) GetConnection()
+        {
+            // Find the closest or "hottest" available connection.
+            for (int i = 0; i < _connections.Length; i++)
+            {
+                // Try to acquire the connection by marking it as in-use atomically.
+                if (Interlocked.CompareExchange(ref _connectionStatus[i], 1, 0) == 0)
+                {
+                    return (_connections[i], i);
+                }
+            }
+
+            // No connections available.
+            Debug.Fail("This should never happen under ActionBlock constraints.");
+
+            _logger.LogCritical("No SMTP connections available");
+            throw new InvalidOperationException("No SMTP connections available.");
+        }
+
+        private void ReleaseConnection(int index)
+        {
+            // Simply mark as available
+            Interlocked.Exchange(ref _connectionStatus[index], 0);
+        }
 
         private EmailSenderOptions? GetOptions()
         {
@@ -605,33 +664,30 @@ namespace ReconArt.Email
 
         private EmailSenderOptions GetOptionsUnsafe() => _mailOptions.CurrentValue;
 
-        private async Task<bool> SendMessageAsync(
-            MimeMessage mimeMessage,
-            IEmailMessage mailMessage,
-            EmailSenderOptions mailOptions,
-            CancellationToken cancellationToken)
+        private async Task<bool> SendMessageAsync(SmtpClient smtpClient, QueuedMail queuedMail, EmailSenderOptions mailOptions)
         {
             EmailFailureReason failureReason = EmailFailureReason.Unknown;
+            CancellationToken cancellationToken = queuedMail.CancellationToken;
 
             // To add some resiliency, we'll attempt to send the message a couple of times before giving up.
-            int retryCount = (int)mailOptions.RetryCount;
-            IEnumerator<TimeSpan> delaysEnumerator = mailOptions.RetryDelayInMilliseconds == 0 || retryCount == 0
+            int retryCount = mailOptions.RetryCount;
+            IEnumerator<TimeSpan> delaysEnumerator = mailOptions.RetryDelayInMilliseconds <= 0 || retryCount <= 0
                 ? Enumerable.Empty<TimeSpan>().GetEnumerator() 
                 : Backoff.DecorrelatedJitterBackoffV2(
-                    medianFirstRetryDelay: TimeSpan.FromMilliseconds((int)mailOptions.RetryDelayInMilliseconds),
+                    medianFirstRetryDelay: TimeSpan.FromMilliseconds(mailOptions.RetryDelayInMilliseconds),
                     retryCount: retryCount).GetEnumerator();
             try
             {
                 do
                 {
-                    if (await TryToConnectAndAuthenticateSmtpClientAsync(mailOptions, cancellationToken).ConfigureAwait(false))
+                    if (await TryToConnectAndAuthenticateSmtpClientAsync(mailOptions, cancellationToken, smtpClient).ConfigureAwait(false))
                     {
                         (bool Successful, bool FailFast, EmailFailureReason FailureReason) result = 
-                            await TrySendingSmtpClientMailMessageAsync(mimeMessage, cancellationToken).ConfigureAwait(false);
+                            await TrySendingSmtpClientMailMessageAsync(smtpClient, queuedMail.MimeMessage, cancellationToken).ConfigureAwait(false);
 
                         if (result.Successful)
                         {
-                            mailMessage.Dispose();
+                            queuedMail.Delivered();
                             return true;
                         }
 
@@ -656,11 +712,6 @@ namespace ReconArt.Email
                     await Task.Delay(retryDelay, cancellationToken).ConfigureAwait(false);
                 } while (true);
             }
-            catch (OperationCanceledException) when (ExceptionFilters.DisposeWithoutUnwindingStack(mailMessage))
-            {
-                // We're only disposing as internal methods should have already logged the exception.
-                throw;
-            }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _logger.LogCritical(ex, "Caught unhandled exception while trying to send message to SMTP server.");
@@ -671,7 +722,7 @@ namespace ReconArt.Email
             }
 
             // We've failed here.
-            return await OnEmailSendingFailureAsync(mailMessage, mailOptions, failureReason).ConfigureAwait(false);
+            return await OnEmailSendingFailureAsync(queuedMail.Message, mailOptions, failureReason).ConfigureAwait(false);
         }
 
 
@@ -698,14 +749,17 @@ namespace ReconArt.Email
             return false;
         }
 
-        private async ValueTask<(bool Successful, bool FailFast, EmailFailureReason)> TrySendingSmtpClientMailMessageAsync(MimeMessage mail, CancellationToken cancellationToken)
+        private async ValueTask<(bool Successful, bool FailFast, EmailFailureReason)> TrySendingSmtpClientMailMessageAsync(
+            SmtpClient smtpClient,
+            MimeMessage mail,
+            CancellationToken cancellationToken)
         {
-            Debug.Assert(_smtpClient.IsConnected,
+            Debug.Assert(smtpClient.IsConnected,
                 "Method should only be called after attempting to establish a connection with the SMTP server.");
 
             try
             {
-                await _smtpClient.SendAsync(mail, cancellationToken).ConfigureAwait(false);
+                await smtpClient.SendAsync(mail, cancellationToken).ConfigureAwait(false);
                 _logger.LogInformation("Successfully sent message to {Recipients}.", string.Join(", ",
                     mail.To.Cast<MailboxAddress>().Select(static adr => adr.Address)));
                 return (true, false, EmailFailureReason.None);
@@ -722,7 +776,7 @@ namespace ReconArt.Email
             }
             catch (SmtpProtocolException ex)
             {
-                if (!_smtpClient.IsConnected)
+                if (!smtpClient.IsConnected)
                 {
                     _logger.LogWarning("Could not send message to the SMTP server - the connection to the server was broken.");
                 }
@@ -774,6 +828,15 @@ namespace ReconArt.Email
         private void UpdateParserOptions(EmailSenderOptions options, string? optionsName)
         {
             _cachedAddressParserOptions = CreateParserOptions(options);
+        }
+
+        private static void DisposeQueuedMail(Task<bool> sendTask, object? state)
+        {
+            QueuedMail queuedMail = (QueuedMail)state!;
+            if (!sendTask.IsCompletedSuccessfully || !sendTask.Result)
+            {
+                queuedMail.Dispose();
+            }
         }
 
         private static ParserOptions CreateParserOptions(EmailSenderOptions options) => new()

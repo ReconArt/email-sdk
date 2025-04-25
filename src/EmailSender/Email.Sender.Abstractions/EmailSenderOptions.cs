@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
+using System.Net.Security;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
@@ -57,7 +58,7 @@ namespace ReconArt.Email
         /// How many times to retry sending an email before giving up.
         /// <br/><br/> <i>Default value:</i> 3
         /// </summary>
-        public uint RetryCount { get; set; } = 3;
+        public int RetryCount { get; set; } = 3;
 
         /// <summary>
         /// How long to approximately wait before retrying to send an email.
@@ -78,7 +79,29 @@ namespace ReconArt.Email
         /// f* (2^(t+1) - 2^(t-1)) for t >= 2; or between 0 and f * 2^(t+1), for t is 0
         /// or 1.
         /// </remarks>
-        public uint RetryDelayInMilliseconds { get; set; } = 2000;
+        public int RetryDelayInMilliseconds { get; set; } = 2000;
+
+        /// <summary>
+        /// Maximum number of concurrent SMTP connections to maintain in the pool.
+        /// <br/><br/> <i>Default value:</i> 3
+        /// </summary>
+        /// <remarks>
+        /// Determines the maximum amount of simultaneous connections to the mail server that will be maintained 
+        /// for processing outgoing messages. This effectively sets the maximum number of threads that will be
+        /// used to send messages concurrently, as well as the connection pool's size.
+        /// <br/>
+        /// Higher values can improve throughput under heavy load
+        /// but may consume more resources and may be limited by the mail server leading to errors.
+        /// </remarks>
+        public int MaxConcurrentConnections { get; set; } = 3;
+
+        /// <summary>
+        /// Callback to validate the server certificate.
+        /// </summary>
+        /// <remarks>
+        /// If no value is speicified, the default validation will be used.
+        /// </remarks>
+        public RemoteCertificateValidationCallback? ServerCertificateValidationCallback { get; set; }
 
         /// <summary>
         /// Set to <see langword="true"/> to treat emails with no recipients as successfully sent.
@@ -184,7 +207,7 @@ namespace ReconArt.Email
         /// <summary>
         /// Gets a value indicating whether the <see cref="Username"/> is an email address.
         /// </summary>
-        public bool IsUsernameEmailAddress => Username is not null && IsRfc5233AddressRegex().IsMatch(Username);
+        public bool IsUsernameEmailAddress => Username is not null && ValidEmailAddressRegex().IsMatch(Username);
 
         /// <inheritdoc/>
         public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
@@ -209,13 +232,17 @@ namespace ReconArt.Email
                 }
             }
 
-            if (FromAddress is not null && !IsRfc5233AddressRegex().IsMatch(FromAddress))
+            if (FromAddress is not null && !ValidEmailAddressRegex().IsMatch(FromAddress))
             {
                 yield return new("From address is not a valid email address.", [nameof(FromAddress)]);
             }
         }
 
-        [GeneratedRegex(@"^(?:[a-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[a-z0-9!#$%&'*+/=?^_`{|}~-]+)*|""(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21\x23-\x5b\x5d-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])*"")@(?:(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]*[a-z0-9])?|\[(?:(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9]))\.){3}(?:(2(5[0-5]|[0-4][0-9])|1[0-9][0-9]|[1-9]?[0-9])|[a-z0-9-]*[a-z0-9]:(?:[\x01-\x08\x0b\x0c\x0e-\x1f\x21-\x5a\x53-\x7f]|\\[\x01-\x09\x0b\x0c\x0e-\x7f])+)\])$")]
-        public static partial Regex IsRfc5233AddressRegex();
+        // Uses the HTML5 living standard, does a willful violation of RFC-5322.
+        // see https://html.spec.whatwg.org/multipage/input.html#valid-e-mail-address
+        [GeneratedRegex(
+        @"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$",
+        RegexOptions.Compiled)]
+        public static partial Regex ValidEmailAddressRegex();
     }
-}
+}   
