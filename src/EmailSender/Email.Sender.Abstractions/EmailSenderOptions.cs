@@ -96,6 +96,17 @@ namespace ReconArt.Email
         public int MaxConcurrentConnections { get; set; } = 3;
 
         /// <summary>
+        /// Number of messages that can be stored in the queue before applying back-pressure mechanisms.
+        /// Set to -1 for storing an unlimited number of messages.
+        /// <br/><br/> <i>Default value:</i> 10,000
+        /// </summary>
+        /// <remarks>
+        /// In the event capacity is reached, calls to <see cref="IEmailSenderService.TryScheduleAsync(IEmailMessage, System.Threading.CancellationToken)"/>
+        /// will begin awaiting asynchronously until such capacity is available and only then return.
+        /// </remarks>
+        public int MessageQueueSize { get; set; } = 10_000;
+
+        /// <summary>
         /// Callback to validate the server certificate.
         /// </summary>
         /// <remarks>
@@ -235,6 +246,11 @@ namespace ReconArt.Email
             if (FromAddress is not null && !ValidEmailAddressRegex().IsMatch(FromAddress))
             {
                 yield return new("From address is not a valid email address.", [nameof(FromAddress)]);
+            }
+
+            if (MessageQueueSize < 1 && MessageQueueSize != -1)
+            {
+                yield return new("MessageQueueSize must be greater than or equal to 1 or be set to unlimited capacity (-1).", [nameof(MessageQueueSize)]);
             }
         }
 

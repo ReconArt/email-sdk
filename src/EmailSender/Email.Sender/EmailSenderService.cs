@@ -8,6 +8,7 @@ using MimeKit.Utils;
 using Polly.Contrib.WaitAndRetry;
 using ReconArt.Email.Sender.Internal;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -62,7 +63,7 @@ namespace ReconArt.Email
                 MaxDegreeOfParallelism = Math.Max(options.MaxConcurrentConnections, 1),
                 SingleProducerConstrained = false,
                 TaskScheduler = TaskScheduler.Default,
-                BoundedCapacity = 10_000
+                BoundedCapacity = options.MessageQueueSize
             });
 
             SmtpClient[] connections = new SmtpClient[options.MaxConcurrentConnections];
@@ -213,7 +214,7 @@ namespace ReconArt.Email
 
         #region Private_Methods
 
-        private ValueTask<bool> InternalTryScheduleAsync(IEmailMessage email, bool awaitCompletion, CancellationToken cancellationToken)
+        private async ValueTask<bool> InternalTryScheduleAsync(IEmailMessage email, bool awaitCompletion, CancellationToken cancellationToken)
         {
             if (cancellationToken.IsCancellationRequested)
             {
@@ -226,13 +227,13 @@ namespace ReconArt.Email
             {
                 Interlocked.Increment(ref _failedMessagesCount);
                 email.Dispose();
-                return new ValueTask<bool>(false);
+                return false;
             }
 
             MimeMessage? mimeMessage = CreateMimeMessage(email, mailOptions, out bool treatAsSuccess);
             if (mimeMessage is null)
             {
-                return HandleMimeMessageResponseAsync(email, mailOptions, treatAsSuccess);
+                return await HandleMimeMessageResponseAsync(email, mailOptions, treatAsSuccess);
             }
 
             QueuedMail queuedMail = new(mimeMessage, email,
@@ -240,62 +241,32 @@ namespace ReconArt.Email
                     ? new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
                     : null, cancellationToken);
 
-            Task<bool> sendTask = _emailScheduleWork.SendAsync(queuedMail, cancellationToken);
-
-            if (sendTask.IsCompleted)
+            bool queued;
+            try
             {
-                if (sendTask.IsCanceled)
-                {
-                    queuedMail.Dispose();
-                    cancellationToken.ThrowIfCancellationRequested();
-                }
-                else if (!sendTask.Result)
-                {
-                    _logger.LogError("Email message could not be processed. " +
-                        "Either we have hit the limit of the queue, or it has stopped accepting new email messages.");
-
-                    Task<bool> eventTask = OnEmailSendingFailureAsync(email, mailOptions, EmailFailureReason.Unknown).AsTask();
-                    _ = eventTask.ContinueWith(DisposeQueuedMail, queuedMail, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
-
-                    return new ValueTask<bool>(eventTask);
-                }
+                queued = await _emailScheduleWork.SendAsync(queuedMail, cancellationToken);
             }
-            else
+            catch when (ExceptionFilters.DisposeWithoutUnwindingStack(queuedMail))
             {
-                // Make sure we clean up any resources if the task is never consumed and also log the occurrence.
-                _ = sendTask.ContinueWith(HandleBufferredQueuedMail, queuedMail, CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+                throw;
             }
 
-                _logger.LogInformation("Email to {Recipients} has been scheduled for sending.",
-                    string.Join(", ", string.Join(", ",
-                        mimeMessage.To.Cast<MailboxAddress>().Select(static adr => adr.Address))));
-
-            return awaitCompletion
-                ? new ValueTask<bool>(queuedMail.TaskCompletionSource!.Task)
-                : new ValueTask<bool>(true);
-        }
-
-        private async Task HandleBufferredQueuedMail(Task<bool> sendTask, object? state)
-        {
-            Tuple<QueuedMail, EmailSenderOptions> context = (Tuple<QueuedMail, EmailSenderOptions>)state!;
-            QueuedMail queuedMail = context.Item1;
-            EmailSenderOptions mailOptions = context.Item2;
-
-            if (!sendTask.IsCompletedSuccessfully)
+            if (!queued)
             {
+                _logger.LogError("Email message could not be processed. " +
+                    "Service has stopped accepting new email messages.");
+
+                await OnEmailSendingFailureAsync(email, mailOptions, EmailFailureReason.Unknown);
                 queuedMail.Dispose();
-            }
-            else
-            {
-                if (!sendTask.Result)
-                {
-                    _logger.LogError("Email message could not be processed. " +
-                        "Either we have hit the limit of the queue, or it has stopped accepting new email messages.");
 
-                    await OnEmailSendingFailureAsync(queuedMail.Message, mailOptions, EmailFailureReason.Unknown);
-                    queuedMail.Dispose();
-                }
+                return false;
             }
+
+            _logger.LogInformation("Email to {Recipients} has been scheduled for sending.",
+                string.Join(", ", 
+                    mimeMessage.To.Cast<MailboxAddress>().Select(static adr => adr.Address)));
+
+            return !awaitCompletion || await queuedMail.TaskCompletionSource!.Task;
         }
 
         private ValueTask<bool> HandleMimeMessageResponseAsync(IEmailMessage email, EmailSenderOptions mailOptions, bool treatAsSuccess)
@@ -829,16 +800,6 @@ namespace ReconArt.Email
         {
             _cachedAddressParserOptions = CreateParserOptions(options);
         }
-
-        private static void DisposeQueuedMail(Task<bool> sendTask, object? state)
-        {
-            QueuedMail queuedMail = (QueuedMail)state!;
-            if (!sendTask.IsCompletedSuccessfully || !sendTask.Result)
-            {
-                queuedMail.Dispose();
-            }
-        }
-
         private static ParserOptions CreateParserOptions(EmailSenderOptions options) => new()
         {
             AddressParserComplianceMode = options.UseStrictAddressParser ? RfcComplianceMode.Strict : RfcComplianceMode.Loose,
