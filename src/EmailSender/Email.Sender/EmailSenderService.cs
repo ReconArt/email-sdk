@@ -236,10 +236,11 @@ namespace ReconArt.Email
                 return await HandleMimeMessageResponseAsync(email, mailOptions, treatAsSuccess);
             }
 
-            QueuedMail queuedMail = new(mimeMessage, email,
-                awaitCompletion
-                    ? new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
-                    : null, cancellationToken);
+            // If we do not need to await this, **DO NOT** pass cancellation token to the queued mail.
+            // Instead, use that cancellation token in the scheduling of the task only.
+            QueuedMail queuedMail = awaitCompletion 
+                ? new(mimeMessage, email, new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously), cancellationToken)
+                : new(mimeMessage, email, CancellationToken.None);
 
             bool queued;
             try
