@@ -8,7 +8,6 @@ using MimeKit.Utils;
 using Polly.Contrib.WaitAndRetry;
 using ReconArt.Email.Sender.Internal;
 using System;
-using System.Collections;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
@@ -126,7 +125,7 @@ namespace ReconArt.Email
             {
                 EmailSenderOptions options = GetOptionsUnsafe();
 
-                await client.ConnectAsync(options.Host, options.Port, SecureSocketOptions.StartTls, cancellationToken)
+                await client.ConnectAsync(options.Host, options.Port, SecureSocketOptions.Auto, cancellationToken)
                     .ConfigureAwait(false);
 
                 if (options.RequiresAuthentication)
@@ -507,7 +506,7 @@ namespace ReconArt.Email
             {
                 if (!smtpClient.IsConnected)
                 {
-                    await smtpClient.ConnectAsync(options.Host, options.Port, SecureSocketOptions.StartTls, cancellationToken: cancellationToken)
+                    await smtpClient.ConnectAsync(options.Host, options.Port, SecureSocketOptions.Auto, cancellationToken: cancellationToken)
                         .ConfigureAwait(false);
                 }
 
