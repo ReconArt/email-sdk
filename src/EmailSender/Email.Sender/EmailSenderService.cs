@@ -117,36 +117,40 @@ namespace ReconArt.Email
         /// <inheritdoc/>
         public async ValueTask<Exception?> TestConnectionAsync(CancellationToken cancellationToken = default)
         {
-            SmtpClient client = new()
-            {
-                ServerCertificateValidationCallback = static (s, c, h, e) => true
-            };
             try
             {
                 EmailSenderOptions options = GetOptionsUnsafe();
-
-                await client.ConnectAsync(options.Host, options.Port, SecureSocketOptions.Auto, cancellationToken)
-                    .ConfigureAwait(false);
-
-                if (options.RequiresAuthentication)
+                SmtpClient client = new();
+                if (options.ServerCertificateValidationCallback is not null)
                 {
-                    await client.AuthenticateAsync(options.Username ?? string.Empty, options.Password ?? string.Empty, cancellationToken)
-                        .ConfigureAwait(false);
+                    client.ServerCertificateValidationCallback = options.ServerCertificateValidationCallback;
                 }
 
-                return null;
+                try
+                {
+                    await client.ConnectAsync(options.Host, options.Port, SecureSocketOptions.Auto, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    if (options.RequiresAuthentication)
+                    {
+                        await client.AuthenticateAsync(options.Username ?? string.Empty, options.Password ?? string.Empty, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+
+                    return null;
+                }
+                finally
+                {
+                    // Do not pass the cancellation token. We want to disconnect gracefully.
+#pragma warning disable CA2016 // Forward the 'CancellationToken' parameter to methods
+                    await client.DisconnectAsync(true).ConfigureAwait(false);
+#pragma warning restore CA2016 // Forward the 'CancellationToken' parameter to methods
+                    client.Dispose();
+                }
             }
             catch (Exception ex)
             {
                 return ex;
-            }
-            finally
-            {
-                // Do not pass the cancellation token. We want to disconnect gracefully.
-#pragma warning disable CA2016 // Forward the 'CancellationToken' parameter to methods
-                await client.DisconnectAsync(true).ConfigureAwait(false);
-#pragma warning restore CA2016 // Forward the 'CancellationToken' parameter to methods
-                client.Dispose();
             }
         }
 
