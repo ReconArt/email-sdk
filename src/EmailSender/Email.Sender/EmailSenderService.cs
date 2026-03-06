@@ -236,7 +236,13 @@ namespace ReconArt.Email
             MimeMessage? mimeMessage = CreateMimeMessage(email, mailOptions, out bool treatAsSuccess);
             if (mimeMessage is null)
             {
-                return await HandleMimeMessageResponseAsync(email, mailOptions, treatAsSuccess);
+                if (!treatAsSuccess && mailOptions.SignalFailureOnInvalidParameters)
+                {
+                    await OnEmailSendingFailureAsync(email, mailOptions, EmailFailureReason.InvalidParameters);
+                }
+
+                email.Dispose();
+                return treatAsSuccess;
             }
 
             // If we do not need to await this, **DO NOT** pass cancellation token to the queued mail.
@@ -271,20 +277,6 @@ namespace ReconArt.Email
                     mimeMessage.To.Cast<MailboxAddress>().Select(static adr => adr.Address)));
 
             return !awaitCompletion || await queuedMail.TaskCompletionSource!.Task;
-        }
-
-        private ValueTask<bool> HandleMimeMessageResponseAsync(IEmailMessage email, EmailSenderOptions mailOptions, bool treatAsSuccess)
-        {
-            if (!treatAsSuccess && mailOptions.SignalFailureOnInvalidParameters)
-            {
-                return OnEmailSendingFailureAsync(email, mailOptions, EmailFailureReason.InvalidParameters);
-            }
-            else
-            {
-                email.Dispose();
-            }
-
-            return new ValueTask<bool>(treatAsSuccess);
         }
 
         private MimeMessage? CreateMimeMessage(IEmailMessage email, EmailSenderOptions mailOptions, out bool treatAsSuccess)
@@ -720,7 +712,6 @@ namespace ReconArt.Email
                 }
             }
 
-            mailMessage.Dispose();
             return false;
         }
 
