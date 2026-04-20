@@ -4,11 +4,11 @@
 		<TargetFrameworks>net10.0;net9.0;net8.0;</TargetFrameworks>
 		<Nullable>enable</Nullable>
 		<PackageId>ReconArt.Email.Sender.Identity</PackageId>
-		<Description>Extends the default implementation with supppot for the ASP.NET Core Identity infrastructure.</Description>
+		<Description>Extends the default implementation with support for the ASP.NET Core Identity infrastructure.</Description>
 		<Copyright>Copyright © ReconArt, Inc. 2008-2024</Copyright>
 		<Authors>ReconArt, Inc.</Authors>
 		<Company>ReconArt, Inc.</Company>
-		<PackageVersion>3.1.0</PackageVersion>
+		<PackageVersion>3.1.1</PackageVersion>
 		<GeneratePackageOnBuild>false</GeneratePackageOnBuild>
 		<RepositoryUrl>https://github.com/ReconArt/email-sdk</RepositoryUrl>
 		<PublishRepositoryUrl>true</PublishRepositoryUrl>
@@ -32,7 +32,7 @@
 	</ItemGroup>
 
 	<ItemGroup Condition="'$(TargetFramework)' == 'net10.0'">
-		<PackageReference Include="Microsoft.AspNetCore.Identity.UI" Version="10.0.3" />
+		<PackageReference Include="Microsoft.AspNetCore.Identity.UI" Version="10.0.6" />
 	</ItemGroup>
 
 	<ItemGroup>
