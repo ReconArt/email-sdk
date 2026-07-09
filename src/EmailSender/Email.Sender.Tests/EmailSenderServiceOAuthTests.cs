@@ -500,6 +500,73 @@ public sealed class EmailSenderServiceOAuthTests
     }
 
     [Fact]
+    public async Task TrySendAsync_DynamicProvider_StructuralReload_RebuildsSlotUsingCurrentRevision()
+    {
+        TestEmailSenderOptionsProvider provider = new(new EmailSenderOptionsSnapshot
+        {
+            Options = CreateBasicOptions(requiresAuthentication: true),
+            ConfigurationRevision = "basic-1"
+        });
+
+        TaskCompletionSource noOpStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        TaskCompletionSource releaseNoOp = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        int clientCount = 0;
+
+        FakeSmtpClientFactory factory = new(() =>
+        {
+            clientCount++;
+            if (clientCount == 1)
+            {
+                return new FakeSmtpClient
+                {
+                    NoOpAsyncHandler = async cancellationToken =>
+                    {
+                        noOpStarted.TrySetResult();
+                        await releaseNoOp.Task.WaitAsync(cancellationToken);
+                    }
+                };
+            }
+
+            return new FakeSmtpClient();
+        });
+
+        await using EmailSenderService service = CreateDynamicService(provider, factory);
+
+        bool firstSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
+        Task<bool> secondSendTask = service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body")).AsTask();
+
+        await noOpStarted.Task;
+
+        provider.SetSnapshot(new EmailSenderOptionsSnapshot
+        {
+            Options = CreateOAuth2Options(
+                accessToken: "oauth-token",
+                accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(30),
+                refreshAccessTokenAsync: _ => ValueTask.FromResult(new EmailSenderOAuthRefreshResult
+                {
+                    AccessToken = "oauth-refresh-token",
+                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(60)
+                })),
+            ConfigurationRevision = "oauth-1"
+        });
+
+        Exception? testConnectionException = await service.TestConnectionAsync();
+        releaseNoOp.SetResult();
+        bool secondSend = await secondSendTask;
+
+        Assert.True(firstSend);
+        Assert.Null(testConnectionException);
+        Assert.True(secondSend);
+        Assert.Equal(3, factory.CreatedClients.Count);
+        Assert.Equal(1, factory.CreatedClients[0].BasicAuthenticationCount);
+        Assert.Equal(0, factory.CreatedClients[0].OAuthAuthenticationCount);
+        Assert.Equal(1, factory.CreatedClients[1].OAuthAuthenticationCount);
+        Assert.Equal(0, factory.CreatedClients[2].BasicAuthenticationCount);
+        Assert.Equal(1, factory.CreatedClients[2].OAuthAuthenticationCount);
+        Assert.Equal(["oauth-token"], factory.CreatedClients[2].OAuthAccessTokens);
+    }
+
+    [Fact]
     public async Task TrySendAsync_DynamicProvider_RemovingConfiguration_DeactivatesSenderAndDisconnectsIdleClient()
     {
         TestEmailSenderOptionsProvider provider = new(new EmailSenderOptionsSnapshot

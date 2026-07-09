@@ -9,5 +9,7 @@ namespace ReconArt.Email.Sender.Internal
         public bool RequiresReconnect;
 
         public bool RequiresClientReinitialization;
+
+        public string? ConfigurationRevision;
     }
 }

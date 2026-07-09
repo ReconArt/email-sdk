@@ -558,16 +558,19 @@ namespace ReconArt.Email
             SmtpConnectionSlot? connectionSlot,
             CancellationToken cancellationToken)
         {
+            EmailSenderOptions effectiveOptions = options;
+
             try
             {
                 if (connectionSlot is not null)
                 {
-                    smtpClient = await EnsureConnectionSlotRuntimeMatchesOptionsAsync(connectionSlot, options).ConfigureAwait(false);
+                    (smtpClient, effectiveOptions) =
+                        await EnsureConnectionSlotRuntimeMatchesOptionsAsync(connectionSlot, options, cancellationToken).ConfigureAwait(false);
                 }
 
-                if (options.AuthenticationType == EmailSenderAuthenticationType.OAuth2)
+                if (effectiveOptions.AuthenticationType == EmailSenderAuthenticationType.OAuth2)
                 {
-                    await EnsureValidOAuthAccessTokenAsync(options, cancellationToken).ConfigureAwait(false);
+                    await EnsureValidOAuthAccessTokenAsync(effectiveOptions, cancellationToken).ConfigureAwait(false);
 
                     if (connectionSlot is not null && connectionSlot.RequiresReconnect && smtpClient.IsConnected)
                     {
@@ -577,14 +580,14 @@ namespace ReconArt.Email
 
                 if (!smtpClient.IsConnected)
                 {
-                    await smtpClient.ConnectAsync(options.Host, options.Port, SecureSocketOptions.Auto, cancellationToken).ConfigureAwait(false);
+                    await smtpClient.ConnectAsync(effectiveOptions.Host, effectiveOptions.Port, SecureSocketOptions.Auto, cancellationToken).ConfigureAwait(false);
                 }
 
-                if (options.AuthenticationType == EmailSenderAuthenticationType.Basic)
+                if (effectiveOptions.AuthenticationType == EmailSenderAuthenticationType.Basic)
                 {
-                    if (options.RequiresAuthentication && !smtpClient.IsAuthenticated)
+                    if (effectiveOptions.RequiresAuthentication && !smtpClient.IsAuthenticated)
                     {
-                        await smtpClient.AuthenticateAsync(options.Username ?? string.Empty, options.Password ?? string.Empty, cancellationToken)
+                        await smtpClient.AuthenticateAsync(effectiveOptions.Username ?? string.Empty, effectiveOptions.Password ?? string.Empty, cancellationToken)
                             .ConfigureAwait(false);
                     }
                 }
@@ -592,8 +595,8 @@ namespace ReconArt.Email
                 {
                     if (!smtpClient.IsAuthenticated)
                     {
-                        string accessToken = options.AccessToken ?? string.Empty;
-                        SaslMechanismOAuth2 oauthMechanism = new(options.Username ?? string.Empty, accessToken);
+                        string accessToken = effectiveOptions.AccessToken ?? string.Empty;
+                        SaslMechanismOAuth2 oauthMechanism = new(effectiveOptions.Username ?? string.Empty, accessToken);
                         await smtpClient.AuthenticateAsync(oauthMechanism, cancellationToken).ConfigureAwait(false);
                         if (connectionSlot is not null)
                         {
@@ -606,23 +609,23 @@ namespace ReconArt.Email
             {
                 throw;
             }
-            catch (Exception ex) when (options.AuthenticationType == EmailSenderAuthenticationType.OAuth2 && IsRefreshableAuthenticationException(ex))
+            catch (Exception ex) when (effectiveOptions.AuthenticationType == EmailSenderAuthenticationType.OAuth2 && IsRefreshableAuthenticationException(ex))
             {
                 _logger.LogWarning(ex, "OAuth2 authentication failed. A token refresh will be attempted.");
-                return new(false, true, EmailFailureReason.AuthenticationFailed, ex);
+                return new(false, true, EmailFailureReason.AuthenticationFailed, ex, effectiveOptions);
             }
             catch (Exception ex) when (IsAuthenticationFailure(ex))
             {
                 _logger.LogCritical(ex, "Authentication with the SMTP server failed.");
-                return new(false, false, EmailFailureReason.AuthenticationFailed, ex);
+                return new(false, false, EmailFailureReason.AuthenticationFailed, ex, effectiveOptions);
             }
             catch (Exception ex)
             {
                 _logger.LogCritical(ex, "Critical error in connecting to SMTP server.");
-                return new(false, false, EmailFailureReason.Unknown, ex);
+                return new(false, false, EmailFailureReason.Unknown, ex, effectiveOptions);
             }
 
-            return new(true, false, EmailFailureReason.None, null);
+            return new(true, false, EmailFailureReason.None, null, effectiveOptions);
         }
 
         private async Task<bool> ProcessMessageAsync(QueuedMail queuedMail)
@@ -640,16 +643,16 @@ namespace ReconArt.Email
                     return false;
                 }
 
+                EmailSenderOptions effectiveMailOptions = mailOptions;
+
                 SmtpConnectionSlot connectionSlot = GetConnection();
                 try
                 {
                     try
                     {
-                        IEmailSmtpClient smtpClient = connectionSlot.Client;
-                        if (connectionSlot.RequiresClientReinitialization)
-                        {
-                            smtpClient = await EnsureConnectionSlotRuntimeMatchesOptionsAsync(connectionSlot, mailOptions).ConfigureAwait(false);
-                        }
+                        (IEmailSmtpClient smtpClient, effectiveMailOptions) =
+                            await EnsureConnectionSlotRuntimeMatchesOptionsAsync(connectionSlot, effectiveMailOptions, queuedMail.CancellationToken)
+                                .ConfigureAwait(false);
 
                         if (smtpClient.IsConnected)
                         {
@@ -671,8 +674,8 @@ namespace ReconArt.Email
                     }
 
                     return wasDisposed
-                        ? await OnEmailSendingFailureAsync(queuedMail.Message, mailOptions, EmailFailureReason.Disposed).ConfigureAwait(false)
-                        : await SendMessageAsync(connectionSlot, queuedMail, mailOptions).ConfigureAwait(false);
+                        ? await OnEmailSendingFailureAsync(queuedMail.Message, effectiveMailOptions, EmailFailureReason.Disposed).ConfigureAwait(false)
+                        : await SendMessageAsync(connectionSlot, queuedMail, effectiveMailOptions).ConfigureAwait(false);
                 }
                 finally
                 {
@@ -844,6 +847,11 @@ namespace ReconArt.Email
 
             if (!requiresClientReinitialization)
             {
+                foreach (SmtpConnectionSlot connectionSlot in _connectionSlots)
+                {
+                    connectionSlot.ConfigurationRevision = configurationRevision;
+                }
+
                 return;
             }
 
@@ -864,6 +872,7 @@ namespace ReconArt.Email
             {
                 connectionSlot.RequiresClientReinitialization = true;
                 connectionSlot.RequiresReconnect = false;
+                connectionSlot.ConfigurationRevision = null;
 
                 if (Volatile.Read(ref connectionSlot.InUse) == 0)
                 {
@@ -872,25 +881,49 @@ namespace ReconArt.Email
             }
         }
 
-        private async ValueTask<IEmailSmtpClient> EnsureConnectionSlotRuntimeMatchesOptionsAsync(
+        private async ValueTask<(IEmailSmtpClient Client, EmailSenderOptions Options)> EnsureConnectionSlotRuntimeMatchesOptionsAsync(
             SmtpConnectionSlot connectionSlot,
-            EmailSenderOptions options)
+            EmailSenderOptions options,
+            CancellationToken cancellationToken)
         {
-            if (!connectionSlot.RequiresClientReinitialization)
+            if (_mailOptionsProvider is null)
             {
-                return connectionSlot.Client;
+                return (connectionSlot.Client, options);
             }
 
-            IEmailSmtpClient replacementClient = _smtpClientFactory(options);
-            IEmailSmtpClient previousClient = connectionSlot.Client;
+            await _configurationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
 
-            await DisconnectSmtpClientAsync(previousClient).ConfigureAwait(false);
-            connectionSlot.Client = replacementClient;
-            connectionSlot.RequiresClientReinitialization = false;
-            connectionSlot.RequiresReconnect = false;
-            previousClient.Dispose();
+            try
+            {
+                EmailSenderOptions? currentOptions = _runtimeOptions;
+                string? currentConfigurationRevision = _runtimeConfigurationRevision;
+                if (currentOptions is null || string.IsNullOrWhiteSpace(currentConfigurationRevision))
+                {
+                    throw new InvalidOperationException("Email sender is not configured.");
+                }
 
-            return replacementClient;
+                if (!connectionSlot.RequiresClientReinitialization
+                    && string.Equals(connectionSlot.ConfigurationRevision, currentConfigurationRevision, StringComparison.Ordinal))
+                {
+                    return (connectionSlot.Client, currentOptions);
+                }
+
+                IEmailSmtpClient replacementClient = _smtpClientFactory(currentOptions);
+                IEmailSmtpClient previousClient = connectionSlot.Client;
+
+                await DisconnectSmtpClientAsync(previousClient).ConfigureAwait(false);
+                connectionSlot.Client = replacementClient;
+                connectionSlot.ConfigurationRevision = currentConfigurationRevision;
+                connectionSlot.RequiresClientReinitialization = false;
+                connectionSlot.RequiresReconnect = false;
+                previousClient.Dispose();
+
+                return (replacementClient, currentOptions);
+            }
+            finally
+            {
+                _configurationLock.Release();
+            }
         }
 
         private async Task<bool> SendMessageAsync(SmtpConnectionSlot connectionSlot, QueuedMail queuedMail, EmailSenderOptions mailOptions)
@@ -912,6 +945,7 @@ namespace ReconArt.Email
                     IEmailSmtpClient smtpClient = connectionSlot.Client;
                     SmtpClientConnectionResult connectionResult =
                         await TryToConnectAndAuthenticateSmtpClientAsync(mailOptions, smtpClient, connectionSlot, cancellationToken).ConfigureAwait(false);
+                    mailOptions = connectionResult.EffectiveOptions;
                     if (connectionResult.Successful)
                     {
                         smtpClient = connectionSlot.Client;
@@ -1320,7 +1354,8 @@ namespace ReconArt.Email
             bool Successful,
             bool ShouldRefreshOAuthToken,
             EmailFailureReason FailureReason,
-            Exception? Exception);
+            Exception? Exception,
+            EmailSenderOptions EffectiveOptions);
 
         private readonly record struct SmtpSendResult(
             bool Successful,
