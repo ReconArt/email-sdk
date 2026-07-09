@@ -31,17 +31,15 @@ using Microsoft.Extensions.Logging;
 using ReconArt.Email;
 
 // Configure email sender options
-var emailSenderOptions = new EmailSenderOptions
-{
-    Host = "smtp.example.com",
-    Port = 587,
-    RequiresAuthentication = true,
-    Username = "your-username",
-    Password = "your-password",
+var emailSenderOptions = EmailSenderOptions.CreateBasic(
+    host: "smtp.example.com",
+    port: 587,
+    requiresAuthentication: true,
+    username: "your-username",
+    password: "your-password",
     // FromAddress is only necessary in the event Username is not an actual email address,
     // or no authentication is involved.
-    FromAddress = "no-reply@example.com" 
-};
+    fromAddress: "no-reply@example.com");
 
 // Create the email sender service
 var emailSenderService = new EmailSenderService(emailSenderOptions, configureLogger: builder =>
@@ -53,6 +51,39 @@ var emailSenderService = new EmailSenderService(emailSenderOptions, configureLog
 var emailMessage = new EmailMessage("recipient@example.com", "Subject", "Body");
 
 await emailSenderService.TrySendAsync(emailMessage);
+```
+
+### Standalone Usage with OAuth2
+
+To use OAuth2, create the options in code and provide a callback that returns refreshed token values.
+
+```csharp
+using Microsoft.Extensions.Logging;
+using ReconArt.Email;
+
+var emailSenderOptions = EmailSenderOptions.CreateOAuth2(
+    host: "smtp.example.com",
+    port: 587,
+    username: "mailer@example.com",
+    accessToken: initialToken.AccessToken,
+    accessTokenExpiresAtUtc: initialToken.ExpiresAtUtc,
+    refreshAccessTokenAsync: async cancellationToken =>
+    {
+        var refreshedToken = await myTokenProvider.RefreshAsync(cancellationToken);
+
+        return new EmailSenderOAuthRefreshResult
+        {
+            AccessToken = refreshedToken.AccessToken,
+            AccessTokenExpiresAtUtc = refreshedToken.ExpiresAtUtc
+        };
+    });
+
+var emailSenderService = new EmailSenderService(emailSenderOptions, configureLogger: builder =>
+{
+    builder.AddConsole();
+});
+
+await emailSenderService.TrySendAsync(new EmailMessage("recipient@example.com", "Subject", "Body"));
 ```
 
 ### Integration with ASP.NET Core
@@ -88,6 +119,28 @@ In this setup, the `AddEmailSenderService` extension method is used to register 
 
 The method can be called without providing any arguments. In such case, an instance of `EmailSenderOptions` with the default values will be used.
 
+For OAuth2 scenarios, prefer creating `EmailSenderOptions` in code via `CreateOAuth2(...)`, because access tokens and refresh callbacks are typically not a good fit for appsettings-driven configuration.
+
+### Dynamic Runtime Configuration
+
+When SMTP settings are supplied at runtime from a database, cache, secret store, or another external source, register a provider that returns the current effective `EmailSenderOptions` snapshot.
+
+```csharp
+using Microsoft.Extensions.DependencyInjection;
+using ReconArt.Email;
+
+services.AddSingleton<IEmailSenderOptionsProvider, DatabaseEmailSenderOptionsProvider>();
+services.AddEmailSenderService<DatabaseEmailSenderOptionsProvider>();
+```
+
+The provider returns:
+
+- `Options = null` when email sending is currently unavailable
+- a valid `EmailSenderOptions.CreateBasic(...)` snapshot for basic SMTP
+- a valid `EmailSenderOptions.CreateOAuth2(...)` snapshot for OAuth2 SMTP
+
+`ConfigurationRevision` should change when structural SMTP settings change, such as host, port, username, authentication type, or password. OAuth2 token-only updates do not need to change the revision if the refresh callback persists the new tokens and returns them to the sender.
+
 ### Health Monitoring
 
 The `EmailSenderLivenessService` is designed to monitor the health of the email sending process by periodically checking the connection to the SMTP server. It implements Microsoft's `BackgroundService`, allowing it to run in the background and perform health checks.
@@ -104,15 +157,13 @@ using System.Threading;
 using System.Threading.Tasks;
 
 // Configure email sender options
-var emailSenderOptions = new EmailSenderOptions
-{
-    Host = "smtp.example.com",
-    Port = 587,
-    RequiresAuthentication = true,
-    Username = "your-username",
-    Password = "your-password",
-    FromAddress = "no-reply@example.com"
-};
+var emailSenderOptions = EmailSenderOptions.CreateBasic(
+    host: "smtp.example.com",
+    port: 587,
+    requiresAuthentication: true,
+    username: "your-username",
+    password: "your-password",
+    fromAddress: "no-reply@example.com");
 
 // Create the email sender service
 var emailSenderService = new EmailSenderService(emailSenderOptions, configureLogger: builder =>
@@ -163,10 +214,14 @@ For more detailed insights into what each option does, refer to their XML docume
 |---------------------------------|-----------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|
 | Host                            | string                            | Host of the mail server.                                                                                                                                                                                                         | (Required)    |
 | Port                            | int                               | Port of the mail server.                                                                                                                                                                                                         | (Required)    |
-| RequiresAuthentication          | bool                              | Set to `true` when authentication is required when connecting to the server. Uses `Username` and `Password` for authentication.                                                                                                   | true          |
-| Username                        | string?                           | Username to authenticate as for the mail server.                                                                                                                                                                                 | null          |
-| FromAddress                     | string?                           | Email address to send emails from. If `null`, `Username` will be used instead.                                                                                                                                                   | null          |
-| Password                        | string?                           | Password to authenticate as for the mail server.                                                                                                                                                                                 | null          |
+| AuthenticationType             | EmailSenderAuthenticationType      | Selects the SMTP authentication flow. Use `Basic` for traditional SMTP and `OAuth2` for token-based auth.                                                                                                                       | Basic         |
+| RequiresAuthentication         | bool                               | Applies only to `AuthenticationType = Basic`. When `true`, uses `Username` and `Password` for SMTP basic auth; when `false`, only connects.                                                                                     | true          |
+| Username                       | string?                            | Username to authenticate as for the mail server. Required for basic-authenticated SMTP and OAuth2.                                                                                                                               | null          |
+| FromAddress                    | string?                            | Email address to send emails from. If `null`, `Username` will be used when it is a valid email address.                                                                                                                         | null          |
+| Password                       | string?                            | Password to authenticate as for the mail server. Used only for `AuthenticationType = Basic` when `RequiresAuthentication = true`.                                                                                                | null          |
+| AccessToken                    | string?                            | OAuth2 access token used for SMTP authentication. Required when `AuthenticationType = OAuth2`.                                                                                                                                   | null          |
+| AccessTokenExpiresAtUtc        | DateTime                           | UTC expiration time of the OAuth2 access token. Required when `AuthenticationType = OAuth2`.                                                                                                                                     | 0001-01-01    |
+| RefreshAccessTokenAsync        | Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>>? | Callback that returns refreshed OAuth2 token values. Required when `AuthenticationType = OAuth2`.                                                                                                | null          |
 | RetryCount                      | uint                              | Number of times to retry sending an email before giving up.                                                                                                                                                                      | 3             |
 | RetryDelayInMilliseconds        | uint                              | Approximate wait time before retrying to send an email. Uses a jitter formula for delay calculation.                                                                                                                             | 2000          |
 | MaxConcurrentConnections        | int                               | Maximum number of concurrent SMTP connections to maintain in the pool. Determines the maximum amount of simultaneous connections to the mail server that will be maintained for processing outgoing messages. Higher values can improve throughput under heavy load but may consume more resources and may be limited by the mail server. | 3             |

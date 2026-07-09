@@ -4,6 +4,7 @@ using System.ComponentModel.DataAnnotations;
 using System.Net.Security;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace ReconArt.Email
@@ -30,12 +31,21 @@ namespace ReconArt.Email
         public int Port { get; set; }
 
         /// <summary>
-        /// Set to <see langword="true"/> when authentication is required when connecting to the server.
+        /// Gets or sets the authentication flow used when connecting to the SMTP server.
+        /// <br/><br/>
+        /// <i>Default value:</i> <see cref="EmailSenderAuthenticationType.Basic"/>
+        /// </summary>
+        public EmailSenderAuthenticationType AuthenticationType { get; set; } = EmailSenderAuthenticationType.Basic;
+
+        /// <summary>
+        /// Set to <see langword="true"/> when basic authentication is required when connecting to the server.
         /// <br/><br/>
         /// <i>Default value:</i> <see langword="true"/>
         /// </summary>
         /// <remarks>
-        /// <seealso cref="Username"/> and <seealso cref="Password"/> will be used to perform the authentication.
+        /// This property only applies when <see cref="AuthenticationType"/> is <see cref="EmailSenderAuthenticationType.Basic"/>.
+        /// <br/>
+        /// When enabled, <seealso cref="Username"/> and <seealso cref="Password"/> will be used to perform the authentication.
         /// </remarks>
         public bool RequiresAuthentication { get; set; } = true;
 
@@ -52,7 +62,38 @@ namespace ReconArt.Email
         /// <summary>
         /// Password to authenticate as for the mail server.
         /// </summary>
+        /// <remarks>
+        /// This property is only used when <see cref="AuthenticationType"/> is <see cref="EmailSenderAuthenticationType.Basic"/>
+        /// and <see cref="RequiresAuthentication"/> is enabled.
+        /// </remarks>
         public string? Password { get; set; }
+
+        /// <summary>
+        /// OAuth2 access token to authenticate as for the mail server.
+        /// </summary>
+        /// <remarks>
+        /// This property is only used when <see cref="AuthenticationType"/> is <see cref="EmailSenderAuthenticationType.OAuth2"/>.
+        /// </remarks>
+        public string? AccessToken { get; set; }
+
+        /// <summary>
+        /// UTC expiration timestamp of the OAuth2 access token.
+        /// </summary>
+        /// <remarks>
+        /// This property is only used when <see cref="AuthenticationType"/> is <see cref="EmailSenderAuthenticationType.OAuth2"/>.
+        /// </remarks>
+        public DateTime AccessTokenExpiresAtUtc { get; set; }
+
+        /// <summary>
+        /// Called when the email sender needs a refreshed OAuth2 access token.
+        /// </summary>
+        /// <remarks>
+        /// This property is only used when <see cref="AuthenticationType"/> is <see cref="EmailSenderAuthenticationType.OAuth2"/>.
+        /// The returned token values will be applied to <see cref="AccessToken"/> and <see cref="AccessTokenExpiresAtUtc"/>
+        /// on the current <see cref="EmailSenderOptions"/> instance.
+        /// </remarks>
+        [JsonIgnore]
+        public Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>>? RefreshAccessTokenAsync { get; set; }
 
         /// <summary>
         /// How many times to retry sending an email before giving up.
@@ -220,26 +261,135 @@ namespace ReconArt.Email
         /// </summary>
         public bool IsUsernameEmailAddress => Username is not null && ValidEmailAddressRegex().IsMatch(Username);
 
+        /// <summary>
+        /// Creates a new instance of <see cref="EmailSenderOptions"/> configured for the basic SMTP flow.
+        /// </summary>
+        /// <param name="host">Host of the mail server.</param>
+        /// <param name="port">Port of the mail server.</param>
+        /// <param name="requiresAuthentication">Whether basic SMTP authentication should be performed.</param>
+        /// <param name="username">Username to authenticate as.</param>
+        /// <param name="password">Password to authenticate as.</param>
+        /// <param name="fromAddress">Email address to send emails from.</param>
+        /// <returns>A validated <see cref="EmailSenderOptions"/> instance.</returns>
+        /// <exception cref="ValidationException">Thrown when the supplied values are invalid.</exception>
+        public static EmailSenderOptions CreateBasic(
+            string host,
+            int port,
+            bool requiresAuthentication = true,
+            string? username = null,
+            string? password = null,
+            string? fromAddress = null)
+        {
+            EmailSenderOptions options = new()
+            {
+                AuthenticationType = EmailSenderAuthenticationType.Basic,
+                Host = host,
+                Port = port,
+                RequiresAuthentication = requiresAuthentication,
+                Username = username,
+                Password = password,
+                FromAddress = fromAddress
+            };
+
+            ValidateOrThrow(options);
+            return options;
+        }
+
+        /// <summary>
+        /// Creates a new instance of <see cref="EmailSenderOptions"/> configured for the OAuth2 SMTP flow.
+        /// </summary>
+        /// <param name="host">Host of the mail server.</param>
+        /// <param name="port">Port of the mail server.</param>
+        /// <param name="username">Username to authenticate as.</param>
+        /// <param name="accessToken">Initial OAuth2 access token.</param>
+        /// <param name="accessTokenExpiresAtUtc">Initial OAuth2 access token expiration timestamp, in UTC.</param>
+        /// <param name="refreshAccessTokenAsync">Callback used to refresh the OAuth2 access token.</param>
+        /// <param name="fromAddress">Email address to send emails from.</param>
+        /// <returns>A validated <see cref="EmailSenderOptions"/> instance.</returns>
+        /// <exception cref="ValidationException">Thrown when the supplied values are invalid.</exception>
+        public static EmailSenderOptions CreateOAuth2(
+            string host,
+            int port,
+            string username,
+            string accessToken,
+            DateTime accessTokenExpiresAtUtc,
+            Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>> refreshAccessTokenAsync,
+            string? fromAddress = null)
+        {
+            EmailSenderOptions options = new()
+            {
+                AuthenticationType = EmailSenderAuthenticationType.OAuth2,
+                Host = host,
+                Port = port,
+                RequiresAuthentication = true,
+                Username = username,
+                AccessToken = accessToken,
+                AccessTokenExpiresAtUtc = accessTokenExpiresAtUtc,
+                RefreshAccessTokenAsync = refreshAccessTokenAsync,
+                FromAddress = fromAddress
+            };
+
+            ValidateOrThrow(options);
+            return options;
+        }
+
         /// <inheritdoc/>
         public IEnumerable<ValidationResult> Validate(ValidationContext validationContext)
         {
-            if (RequiresAuthentication)
+            if (!Enum.IsDefined(AuthenticationType))
+            {
+                yield return new("AuthenticationType is not valid.", [nameof(AuthenticationType)]);
+            }
+
+            if (AuthenticationType == EmailSenderAuthenticationType.Basic)
+            {
+                if (RequiresAuthentication)
+                {
+                    if (string.IsNullOrWhiteSpace(Username))
+                    {
+                        yield return new("Username is required when basic authentication is enabled.", [nameof(Username)]);
+                    }
+
+                    if (string.IsNullOrWhiteSpace(Password))
+                    {
+                        yield return new("Password is required when basic authentication is enabled.", [nameof(Password)]);
+                    }
+
+                    if (!IsUsernameEmailAddress && string.IsNullOrWhiteSpace(FromAddress))
+                    {
+                        yield return new("From header is required when username is not an email address.", [nameof(FromAddress)]);
+                    }
+                }
+                else if (string.IsNullOrWhiteSpace(FromAddress))
+                {
+                    yield return new("From header is required when authentication is disabled.", [nameof(FromAddress)]);
+                }
+            }
+            else if (AuthenticationType == EmailSenderAuthenticationType.OAuth2)
             {
                 if (string.IsNullOrWhiteSpace(Username))
                 {
-                    yield return new("Username is required when authentication is enabled.", [nameof(Username)]);
+                    yield return new("Username is required when OAuth2 authentication is enabled.", [nameof(Username)]);
+                }
+
+                if (string.IsNullOrWhiteSpace(AccessToken))
+                {
+                    yield return new("AccessToken is required when OAuth2 authentication is enabled.", [nameof(AccessToken)]);
+                }
+
+                if (AccessTokenExpiresAtUtc == default)
+                {
+                    yield return new("AccessTokenExpiresAtUtc is required when OAuth2 authentication is enabled.", [nameof(AccessTokenExpiresAtUtc)]);
+                }
+
+                if (RefreshAccessTokenAsync is null)
+                {
+                    yield return new("RefreshAccessTokenAsync is required when OAuth2 authentication is enabled.", [nameof(RefreshAccessTokenAsync)]);
                 }
 
                 if (!IsUsernameEmailAddress && string.IsNullOrWhiteSpace(FromAddress))
                 {
                     yield return new("From header is required when username is not an email address.", [nameof(FromAddress)]);
-                }
-            }
-            else
-            {
-                if (string.IsNullOrWhiteSpace(FromAddress))
-                {
-                    yield return new("From header is required when authentication is disabled.", [nameof(FromAddress)]);
                 }
             }
 
@@ -260,5 +410,8 @@ namespace ReconArt.Email
         @"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$",
         RegexOptions.Compiled)]
         public static partial Regex ValidEmailAddressRegex();
+
+        private static void ValidateOrThrow(EmailSenderOptions options) =>
+            Validator.ValidateObject(options, new ValidationContext(options), validateAllProperties: true);
     }
 }   

@@ -1,0 +1,56 @@
+name: Build and deploy
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+    branches:
+    - develop
+    - main
+
+concurrency:
+  group: email-sender-${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
+  
+permissions:
+  contents: read
+
+env:
+  DOTNET_INSTALL_DIR: D:\actions-cache\dotnet
+  DOTNET_MULTILEVEL_LOOKUP: 0
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  backend-validation:
+    name: Validate backend build and tests
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3ced7
+        with:
+          dotnet-version: 10.0.x
+          
+      - name: Set and verify dotnet installation
+        shell: powershell
+        run: |
+          $dotnetExe = Join-Path $env:DOTNET_INSTALL_DIR 'dotnet.exe'
+
+          if (-not (Test-Path $dotnetExe)) {
+            throw "dotnet.exe was not found under DOTNET_INSTALL_DIR: $env:DOTNET_INSTALL_DIR"
+          }
+
+          "DOTNET_EXE=$dotnetExe" >> $env:GITHUB_ENV
+          & $dotnetExe --info
+          
+      - name: Build solution
+        shell: powershell
+        run: |
+            & $env:DOTNET_EXE build src/EmailSender/ReconArt.Email.Sender.sln --configuration Release
+
+      - name: Run tests
+        shell: powershell
+        run: |
+            & $env:DOTNET_EXE test src/EmailSender/ReconArt.Email.Sender.sln --configuration Release --no-build

@@ -8,7 +8,11 @@ This package contains the core abstractions for the ReconArt.Email.Sender packag
 - `IEmailSenderService` for the contract of the email sending service.
 - `IEmailSenderLivenessService` to check the liveness of the email sending service.
 - `EmailFailureReason` to provide a reason for email sending failure.
+- `EmailSenderAuthenticationType` to select between basic SMTP and OAuth2.
 - `EmailSenderOptions` to configure the email sending service.
+- `IEmailSenderOptionsProvider` to supply runtime email sender configuration snapshots.
+- `EmailSenderOptionsSnapshot` to represent the current runtime sender configuration and structural revision.
+- `EmailSenderOAuthRefreshResult` to return refreshed OAuth2 token values.
 - `EmailSenderLivenessOptions` to configure the email sending liveness service.
 - `EmailSenderLivenessSnapshot` to represent a liveness snapshot of the email sending service.
 

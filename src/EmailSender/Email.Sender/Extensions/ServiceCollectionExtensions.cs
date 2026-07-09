@@ -54,6 +54,22 @@ namespace ReconArt.Email
         }
 
         /// <summary>
+        /// Registers an <see cref="IEmailSenderService"/> in the service collection by using a runtime options provider.
+        /// </summary>
+        /// <typeparam name="TOptionsProvider">Provider type that supplies the current email sender options snapshot.</typeparam>
+        /// <param name="services">Service collection to use.</param>
+        /// <returns>A reference to this instance after the operation has completed.</returns>
+        public static IServiceCollection AddEmailSenderService<TOptionsProvider>(this IServiceCollection services)
+            where TOptionsProvider : class, IEmailSenderOptionsProvider
+        {
+            services.TryAddSingleton<IEmailSenderService>(static provider =>
+                new EmailSenderService(
+                    provider.GetRequiredService<TOptionsProvider>(),
+                    provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<EmailSenderService>>()));
+            return services;
+        }
+
+        /// <summary>
         /// Adds <see cref="EmailSenderOptions"/> as an option in ASP.NET Core.
         /// </summary>
         /// <remarks>
