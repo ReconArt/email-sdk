@@ -62,6 +62,7 @@ namespace ReconArt.Email
         public static IServiceCollection AddEmailSenderService<TOptionsProvider>(this IServiceCollection services)
             where TOptionsProvider : class, IEmailSenderOptionsProvider
         {
+            services.TryAddSingleton<TOptionsProvider>();
             services.TryAddSingleton<IEmailSenderService>(static provider =>
                 new EmailSenderService(
                     provider.GetRequiredService<TOptionsProvider>(),
