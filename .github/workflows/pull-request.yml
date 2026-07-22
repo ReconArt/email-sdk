@@ -8,7 +8,7 @@ on:
     - main
 
 concurrency:
-  group: email-sender-${{ github.workflow }}-${{ github.head_ref }}
+  group: email-sdk-${{ github.workflow }}-${{ github.head_ref }}
   cancel-in-progress: true
   
 permissions:
@@ -22,14 +22,14 @@ env:
 jobs:
   backend-validation:
     name: Validate backend build and tests
-    runs-on: windows-latest
+    runs-on: rdf-runner
 
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
 
       - name: Setup .NET SDK
-        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3ced7
+        uses: actions/setup-dotnet@c2fa09f4bde5ebb9d1777cf28262a3eb3db3ced7
         with:
           dotnet-version: 10.0.x
           
