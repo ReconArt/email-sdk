@@ -24,6 +24,9 @@ namespace ReconArt.Email.Sender.Internal
 
         public bool IsAuthenticated => _client.IsAuthenticated;
 
+        public void UpdateServerCertificateValidationCallback(RemoteCertificateValidationCallback? serverCertificateValidationCallback) =>
+            _client.ServerCertificateValidationCallback = serverCertificateValidationCallback;
+
         public Task ConnectAsync(string host, int port, SecureSocketOptions options, CancellationToken cancellationToken) =>
             _client.ConnectAsync(host, port, options, cancellationToken);
 

@@ -13,6 +13,11 @@ namespace ReconArt.Email
         public string AccessToken { get; set; } = string.Empty;
 
         /// <summary>
+        /// Gets or sets the refreshed OAuth2 refresh token, when the OAuth2 provider rotates it.
+        /// </summary>
+        public string? RefreshToken { get; set; }
+
+        /// <summary>
         /// Gets or sets the UTC expiration timestamp of the refreshed OAuth2 access token.
         /// </summary>
         public DateTime AccessTokenExpiresAtUtc { get; set; }

@@ -1,5 +1,6 @@
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using Xunit;
 
 namespace ReconArt.Email.Sender.Tests;
@@ -7,43 +8,71 @@ namespace ReconArt.Email.Sender.Tests;
 public sealed class ServiceCollectionExtensionsTests
 {
     [Fact]
-    public void AddEmailSenderService_DynamicProvider_RegistersProviderTypeAutomatically()
+    public async Task AddEmailSenderService_RuntimeMonitor_RegistersMonitorTypeAutomatically()
     {
         ServiceCollection services = new();
         services.AddLogging();
-        services.AddSingleton(new TestDynamicProviderDependency());
+        services.AddSingleton(new TestRuntimeMonitorDependency());
 
-        services.AddEmailSenderService<TestDynamicEmailSenderOptionsProvider>();
+        services.AddEmailSenderService<TestRuntimeEmailSenderOptionsMonitor>();
 
-        using ServiceProvider serviceProvider = services.BuildServiceProvider();
+        await using ServiceProvider serviceProvider = services.BuildServiceProvider();
 
         IEmailSenderService emailSenderService = serviceProvider.GetRequiredService<IEmailSenderService>();
-        TestDynamicEmailSenderOptionsProvider provider = serviceProvider.GetRequiredService<TestDynamicEmailSenderOptionsProvider>();
+        TestRuntimeEmailSenderOptionsMonitor monitor = serviceProvider.GetRequiredService<TestRuntimeEmailSenderOptionsMonitor>();
+        IOptionsMonitor<EmailSenderOptions> resolvedMonitor = serviceProvider.GetRequiredService<IOptionsMonitor<EmailSenderOptions>>();
 
         Assert.IsType<EmailSenderService>(emailSenderService);
+        Assert.Same(monitor, resolvedMonitor);
+        Assert.NotNull(monitor.Dependency);
+    }
+
+    [Fact]
+    public async Task AddEmailSenderService_RuntimeProvider_RegistersProviderTypeAutomatically()
+    {
+        ServiceCollection services = new();
+        services.AddLogging();
+        services.AddSingleton(new TestRuntimeMonitorDependency());
+
+        services.AddEmailSenderService<TestRuntimeEmailSenderOptionsProvider>();
+
+        await using ServiceProvider serviceProvider = services.BuildServiceProvider();
+
+        IEmailSenderService emailSenderService = serviceProvider.GetRequiredService<IEmailSenderService>();
+        TestRuntimeEmailSenderOptionsProvider provider = serviceProvider.GetRequiredService<TestRuntimeEmailSenderOptionsProvider>();
+        IEmailSenderOptionsProvider resolvedProvider = serviceProvider.GetRequiredService<IEmailSenderOptionsProvider>();
+
+        Assert.IsType<EmailSenderService>(emailSenderService);
+        Assert.Same(provider, resolvedProvider);
         Assert.NotNull(provider.Dependency);
     }
 }
 
-internal sealed class TestDynamicProviderDependency;
+internal sealed class TestRuntimeMonitorDependency;
 
-internal sealed class TestDynamicEmailSenderOptionsProvider(TestDynamicProviderDependency dependency) : IEmailSenderOptionsProvider
+internal sealed class TestRuntimeEmailSenderOptionsMonitor(TestRuntimeMonitorDependency dependency) : IOptionsMonitor<EmailSenderOptions>
 {
-    public TestDynamicProviderDependency Dependency { get; } = dependency;
+    public TestRuntimeMonitorDependency Dependency { get; } = dependency;
 
-    public ValueTask<EmailSenderOptionsSnapshot> GetCurrentAsync(CancellationToken cancellationToken)
-    {
-        EmailSenderOptions options = EmailSenderOptions.CreateBasic(
+    public EmailSenderOptions CurrentValue { get; } = EmailSenderOptions.CreateBasic(
+        host: "smtp.example.com",
+        port: 25,
+        requiresAuthentication: false,
+        fromAddress: "from@example.com");
+
+    public EmailSenderOptions Get(string? name) => CurrentValue;
+
+    public IDisposable? OnChange(Action<EmailSenderOptions, string?> listener) => null;
+}
+
+internal sealed class TestRuntimeEmailSenderOptionsProvider(TestRuntimeMonitorDependency dependency) : IEmailSenderOptionsProvider
+{
+    public TestRuntimeMonitorDependency Dependency { get; } = dependency;
+
+    public ValueTask<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellationToken) =>
+        ValueTask.FromResult<EmailSenderOptions?>(EmailSenderOptions.CreateBasic(
             host: "smtp.example.com",
             port: 25,
             requiresAuthentication: false,
-            fromAddress: "from@example.com");
-        options.MaxConcurrentConnections = 1;
-
-        return ValueTask.FromResult(new EmailSenderOptionsSnapshot
-        {
-            Options = options,
-            ConfigurationRevision = "revision-1"
-        });
-    }
+            fromAddress: "from@example.com"));
 }

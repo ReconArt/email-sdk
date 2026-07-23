@@ -1,6 +1,8 @@
 ﻿using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using System;
 
 namespace ReconArt.Email
@@ -54,19 +56,46 @@ namespace ReconArt.Email
         }
 
         /// <summary>
-        /// Registers an <see cref="IEmailSenderService"/> in the service collection by using a runtime options provider.
+        /// Registers an <see cref="IEmailSenderService"/> in the service collection by using a runtime options source.
         /// </summary>
-        /// <typeparam name="TOptionsProvider">Provider type that supplies the current email sender options snapshot.</typeparam>
+        /// <typeparam name="TOptionsSource">
+        /// Options source type that supplies the current email sender options.
+        /// Must implement <see cref="IOptionsMonitor{TOptions}"/> for <see cref="EmailSenderOptions"/> or <see cref="IEmailSenderOptionsProvider"/>.
+        /// </typeparam>
         /// <param name="services">Service collection to use.</param>
         /// <returns>A reference to this instance after the operation has completed.</returns>
-        public static IServiceCollection AddEmailSenderService<TOptionsProvider>(this IServiceCollection services)
-            where TOptionsProvider : class, IEmailSenderOptionsProvider
+        public static IServiceCollection AddEmailSenderService<TOptionsSource>(this IServiceCollection services)
+            where TOptionsSource : class
         {
-            services.TryAddSingleton<TOptionsProvider>();
-            services.TryAddSingleton<IEmailSenderService>(static provider =>
-                new EmailSenderService(
-                    provider.GetRequiredService<TOptionsProvider>(),
-                    provider.GetRequiredService<Microsoft.Extensions.Logging.ILogger<EmailSenderService>>()));
+            Type optionsSourceType = typeof(TOptionsSource);
+            bool isOptionsMonitor = typeof(IOptionsMonitor<EmailSenderOptions>).IsAssignableFrom(optionsSourceType);
+            bool isOptionsProvider = typeof(IEmailSenderOptionsProvider).IsAssignableFrom(optionsSourceType);
+
+            if (!isOptionsMonitor && !isOptionsProvider)
+            {
+                throw new ArgumentException(
+                    $"{optionsSourceType.FullName} must implement {nameof(IOptionsMonitor<EmailSenderOptions>)} or {nameof(IEmailSenderOptionsProvider)}.",
+                    nameof(TOptionsSource));
+            }
+
+            services.TryAddSingleton<TOptionsSource>();
+
+            if (isOptionsProvider)
+            {
+                services.AddSingleton<IEmailSenderOptionsProvider>(static provider =>
+                    (IEmailSenderOptionsProvider)provider.GetRequiredService<TOptionsSource>());
+                services.TryAddSingleton<IEmailSenderService>(static provider =>
+                    new EmailSenderService(
+                        provider.GetRequiredService<IEmailSenderOptionsProvider>(),
+                        provider.GetRequiredService<ILogger<EmailSenderService>>()));
+            }
+            else
+            {
+                services.AddSingleton<IOptionsMonitor<EmailSenderOptions>>(static provider =>
+                    (IOptionsMonitor<EmailSenderOptions>)provider.GetRequiredService<TOptionsSource>());
+                services.TryAddSingleton<IEmailSenderService, EmailSenderService>();
+            }
+
             return services;
         }
 

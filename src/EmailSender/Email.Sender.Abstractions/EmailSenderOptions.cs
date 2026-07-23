@@ -77,6 +77,15 @@ namespace ReconArt.Email
         public string? AccessToken { get; set; }
 
         /// <summary>
+        /// OAuth2 refresh token used by upstream refresh callbacks, when applicable.
+        /// </summary>
+        /// <remarks>
+        /// This property is only used when <see cref="AuthenticationType"/> is <see cref="EmailSenderAuthenticationType.OAuth2"/>.
+        /// It is not used directly for SMTP authentication.
+        /// </remarks>
+        public string? RefreshToken { get; set; }
+
+        /// <summary>
         /// UTC expiration timestamp of the OAuth2 access token.
         /// </summary>
         /// <remarks>
@@ -94,6 +103,16 @@ namespace ReconArt.Email
         /// </remarks>
         [JsonIgnore]
         public Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>>? RefreshAccessTokenAsync { get; set; }
+
+        /// <summary>
+        /// Called after OAuth2 credentials have been refreshed and applied to the current options instance.
+        /// </summary>
+        /// <remarks>
+        /// This property is optional and is intended for upstream persistence or observation.
+        /// Exceptions thrown by this delegate are logged and do not fail the send operation.
+        /// </remarks>
+        [JsonIgnore]
+        public Func<EmailSenderOAuthRefreshResult, CancellationToken, ValueTask>? OnOAuth2CredentialsRefreshed { get; set; }
 
         /// <summary>
         /// How many times to retry sending an email before giving up.
@@ -305,6 +324,8 @@ namespace ReconArt.Email
         /// <param name="accessTokenExpiresAtUtc">Initial OAuth2 access token expiration timestamp, in UTC.</param>
         /// <param name="refreshAccessTokenAsync">Callback used to refresh the OAuth2 access token.</param>
         /// <param name="fromAddress">Email address to send emails from.</param>
+        /// <param name="refreshToken">Initial OAuth2 refresh token, when applicable.</param>
+        /// <param name="onOAuth2CredentialsRefreshed">Optional callback invoked after refreshed OAuth2 credentials are applied.</param>
         /// <returns>A validated <see cref="EmailSenderOptions"/> instance.</returns>
         /// <exception cref="ValidationException">Thrown when the supplied values are invalid.</exception>
         public static EmailSenderOptions CreateOAuth2(
@@ -314,7 +335,9 @@ namespace ReconArt.Email
             string accessToken,
             DateTime accessTokenExpiresAtUtc,
             Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>> refreshAccessTokenAsync,
-            string? fromAddress = null)
+            string? fromAddress = null,
+            string? refreshToken = null,
+            Func<EmailSenderOAuthRefreshResult, CancellationToken, ValueTask>? onOAuth2CredentialsRefreshed = null)
         {
             EmailSenderOptions options = new()
             {
@@ -324,8 +347,10 @@ namespace ReconArt.Email
                 RequiresAuthentication = true,
                 Username = username,
                 AccessToken = accessToken,
+                RefreshToken = refreshToken,
                 AccessTokenExpiresAtUtc = accessTokenExpiresAtUtc,
                 RefreshAccessTokenAsync = refreshAccessTokenAsync,
+                OnOAuth2CredentialsRefreshed = onOAuth2CredentialsRefreshed,
                 FromAddress = fromAddress
             };
 

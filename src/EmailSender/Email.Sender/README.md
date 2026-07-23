@@ -74,8 +74,13 @@ var emailSenderOptions = EmailSenderOptions.CreateOAuth2(
         return new EmailSenderOAuthRefreshResult
         {
             AccessToken = refreshedToken.AccessToken,
+            RefreshToken = refreshedToken.RefreshToken,
             AccessTokenExpiresAtUtc = refreshedToken.ExpiresAtUtc
         };
+    },
+    onOAuth2CredentialsRefreshed: async (refreshedToken, cancellationToken) =>
+    {
+        await myTokenStore.SaveAsync(refreshedToken, cancellationToken);
     });
 
 var emailSenderService = new EmailSenderService(emailSenderOptions, configureLogger: builder =>
@@ -123,23 +128,131 @@ For OAuth2 scenarios, prefer creating `EmailSenderOptions` in code via `CreateOA
 
 ### Dynamic Runtime Configuration
 
-When SMTP settings are supplied at runtime from a database, cache, secret store, or another external source, register a provider that returns the current effective `EmailSenderOptions` snapshot.
+When SMTP settings are supplied at runtime from a database, cache, secret store, or another external source, register either an `IEmailSenderOptionsProvider` or an `IOptionsMonitor<EmailSenderOptions>`.
+
+Use `IEmailSenderOptionsProvider` when fetching options requires custom business logic:
 
 ```csharp
 using Microsoft.Extensions.DependencyInjection;
 using ReconArt.Email;
 
-services.AddSingleton<IEmailSenderOptionsProvider, DatabaseEmailSenderOptionsProvider>();
 services.AddEmailSenderService<DatabaseEmailSenderOptionsProvider>();
 ```
 
-The provider returns:
+The provider returns `null` while the sender should be treated as unavailable. Sends will fail gracefully until the provider returns a valid `EmailSenderOptions.CreateBasic(...)` or `EmailSenderOptions.CreateOAuth2(...)` instance.
 
-- `Options = null` when email sending is currently unavailable
-- a valid `EmailSenderOptions.CreateBasic(...)` snapshot for basic SMTP
-- a valid `EmailSenderOptions.CreateOAuth2(...)` snapshot for OAuth2 SMTP
+```csharp
+public sealed class DatabaseEmailSenderOptionsProvider : IEmailSenderOptionsProvider
+{
+    public async ValueTask<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellationToken)
+    {
+        var settings = await settingsStore.GetCurrentAsync(cancellationToken);
+        if (settings is null)
+        {
+            return null;
+        }
 
-`ConfigurationRevision` should change when structural SMTP settings change, such as host, port, username, authentication type, or password. OAuth2 token-only updates do not need to change the revision if the refresh callback persists the new tokens and returns them to the sender.
+        return EmailSenderOptions.CreateOAuth2(
+            host: settings.Host,
+            port: settings.Port,
+            username: settings.Username,
+            accessToken: settings.AccessToken,
+            accessTokenExpiresAtUtc: settings.AccessTokenExpiresAtUtc,
+            refreshAccessTokenAsync: async token =>
+            {
+                var refreshed = await tokenProvider.RefreshAsync(settings.RefreshToken, token);
+                return new EmailSenderOAuthRefreshResult
+                {
+                    AccessToken = refreshed.AccessToken,
+                    RefreshToken = refreshed.RefreshToken,
+                    AccessTokenExpiresAtUtc = refreshed.ExpiresAtUtc
+                };
+            },
+            onOAuth2CredentialsRefreshed: async (refreshed, token) =>
+            {
+                await settingsStore.SaveTokensAsync(refreshed.AccessToken, refreshed.RefreshToken, refreshed.AccessTokenExpiresAtUtc, token);
+            });
+    }
+}
+```
+
+Use `IOptionsMonitor<EmailSenderOptions>` when your application already maintains the current options in memory:
+
+```csharp
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using ReconArt.Email;
+
+services.AddEmailSenderService<DatabaseEmailSenderOptionsMonitor>();
+```
+
+The monitor should return a non-null `CurrentValue`. If credentials do not exist yet, return a placeholder `EmailSenderOptions` instance with valid `MaxConcurrentConnections` and `MessageQueueSize` values but incomplete transport settings. Sends will fail gracefully until the monitor publishes a valid `EmailSenderOptions.CreateBasic(...)` or `EmailSenderOptions.CreateOAuth2(...)` instance.
+
+`CurrentValue` should be fast and should not synchronously query the database on every send. Load from the database, Redis, or secret store into an in-memory value, replace the whole `EmailSenderOptions` instance when structural SMTP settings change, and notify registered `OnChange` listeners.
+
+For OAuth2, the sender updates `AccessToken`, `AccessTokenExpiresAtUtc`, and `RefreshToken` when a refreshed refresh token is returned. Use `OnOAuth2CredentialsRefreshed` when the application needs to persist or observe those refreshed credentials. Exceptions thrown by user-provided delegates are logged and do not fail the send operation.
+
+```csharp
+public sealed class DatabaseEmailSenderOptionsMonitor : IOptionsMonitor<EmailSenderOptions>
+{
+    private readonly object _lock = new();
+    private readonly List<Action<EmailSenderOptions, string?>> _listeners = [];
+    private EmailSenderOptions _current = new()
+    {
+        MaxConcurrentConnections = 1,
+        MessageQueueSize = 100
+    };
+
+    public EmailSenderOptions CurrentValue
+    {
+        get
+        {
+            lock (_lock)
+            {
+                return _current;
+            }
+        }
+    }
+
+    public EmailSenderOptions Get(string? name) => CurrentValue;
+
+    public IDisposable OnChange(Action<EmailSenderOptions, string?> listener)
+    {
+        lock (_lock)
+        {
+            _listeners.Add(listener);
+        }
+
+        return new Subscription(() =>
+        {
+            lock (_lock)
+            {
+                _listeners.Remove(listener);
+            }
+        });
+    }
+
+    public void Publish(EmailSenderOptions options)
+    {
+        Action<EmailSenderOptions, string?>[] listeners;
+        lock (_lock)
+        {
+            _current = options;
+            listeners = [.. _listeners];
+        }
+
+        foreach (var listener in listeners)
+        {
+            listener(options, Options.DefaultName);
+        }
+    }
+
+    private sealed class Subscription(Action dispose) : IDisposable
+    {
+        public void Dispose() => dispose();
+    }
+}
+```
 
 ### Health Monitoring
 
@@ -220,8 +333,10 @@ For more detailed insights into what each option does, refer to their XML docume
 | FromAddress                    | string?                            | Email address to send emails from. If `null`, `Username` will be used when it is a valid email address.                                                                                                                         | null          |
 | Password                       | string?                            | Password to authenticate as for the mail server. Used only for `AuthenticationType = Basic` when `RequiresAuthentication = true`.                                                                                                | null          |
 | AccessToken                    | string?                            | OAuth2 access token used for SMTP authentication. Required when `AuthenticationType = OAuth2`.                                                                                                                                   | null          |
+| RefreshToken                   | string?                            | OAuth2 refresh token used by upstream refresh callbacks, when applicable. Not used directly for SMTP authentication.                                                                                                             | null          |
 | AccessTokenExpiresAtUtc        | DateTime                           | UTC expiration time of the OAuth2 access token. Required when `AuthenticationType = OAuth2`.                                                                                                                                     | 0001-01-01    |
 | RefreshAccessTokenAsync        | Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>>? | Callback that returns refreshed OAuth2 token values. Required when `AuthenticationType = OAuth2`.                                                                                                | null          |
+| OnOAuth2CredentialsRefreshed   | Func<EmailSenderOAuthRefreshResult, CancellationToken, ValueTask>? | Optional callback invoked after refreshed OAuth2 credentials are applied to the current options instance. Exceptions are logged and ignored.                                      | null          |
 | RetryCount                      | uint                              | Number of times to retry sending an email before giving up.                                                                                                                                                                      | 3             |
 | RetryDelayInMilliseconds        | uint                              | Approximate wait time before retrying to send an email. Uses a jitter formula for delay calculation.                                                                                                                             | 2000          |
 | MaxConcurrentConnections        | int                               | Maximum number of concurrent SMTP connections to maintain in the pool. Determines the maximum amount of simultaneous connections to the mail server that will be maintained for processing outgoing messages. Higher values can improve throughput under heavy load but may consume more resources and may be limited by the mail server. | 3             |
