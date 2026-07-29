@@ -15,8 +15,12 @@ namespace ReconArt.Email
         /// Initializes a new instance of the <see cref="IdentityEmailSenderService"/> class.
         /// </summary>
         /// <param name="mailOptions">Email sender options.</param>
+        /// <param name="startupOptions">Email sender startup options.</param>
         /// <param name="logger">Email sender logger.</param>
-        public SchedulingIdentityEmailSenderService(IOptionsMonitor<EmailSenderOptions> mailOptions, ILogger<EmailSenderService> logger) : base(mailOptions, logger)
+        public SchedulingIdentityEmailSenderService(
+            IOptionsMonitor<EmailSenderOptions> mailOptions,
+            IOptions<EmailSenderStartupOptions> startupOptions,
+            ILogger<EmailSenderService> logger) : base(mailOptions, startupOptions, logger)
         {
         }
 
@@ -24,11 +28,15 @@ namespace ReconArt.Email
         /// Creates an instance of <see cref="SchedulingIdentityEmailSenderService"/>.
         /// </summary>
         /// <param name="mailOptions">Email sender options.</param>
+        /// <param name="startupOptions">Email sender startup options.</param>
         /// <param name="configureLogger">
         /// An optional action to configure the <see cref="ILoggerFactory"/> used by the <see cref="SchedulingIdentityEmailSenderService"/>.
         /// Leave <see langword="null"/> to effectively disable logging.
         /// </param>
-        public SchedulingIdentityEmailSenderService(EmailSenderOptions mailOptions, Action<ILoggingBuilder>? configureLogger = null) : base(mailOptions, configureLogger)
+        public SchedulingIdentityEmailSenderService(
+            EmailSenderOptions mailOptions,
+            EmailSenderStartupOptions startupOptions,
+            Action<ILoggingBuilder>? configureLogger = null) : base(mailOptions, startupOptions, configureLogger)
         {
         }
 

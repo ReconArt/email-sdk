@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.ComponentModel.DataAnnotations;
-using System.Net.Security;
 using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading;
@@ -140,39 +139,6 @@ namespace ReconArt.Email
         /// or 1.
         /// </remarks>
         public int RetryDelayInMilliseconds { get; set; } = 2000;
-
-        /// <summary>
-        /// Maximum number of concurrent SMTP connections to maintain in the pool.
-        /// <br/><br/> <i>Default value:</i> 3
-        /// </summary>
-        /// <remarks>
-        /// Determines the maximum amount of simultaneous connections to the mail server that will be maintained 
-        /// for processing outgoing messages. This effectively sets the maximum number of threads that will be
-        /// used to send messages concurrently, as well as the connection pool's size.
-        /// <br/>
-        /// Higher values can improve throughput under heavy load
-        /// but may consume more resources and may be limited by the mail server leading to errors.
-        /// </remarks>
-        public int MaxConcurrentConnections { get; set; } = 3;
-
-        /// <summary>
-        /// Number of messages that can be stored in the queue before applying back-pressure mechanisms.
-        /// Set to -1 for storing an unlimited number of messages.
-        /// <br/><br/> <i>Default value:</i> 10,000
-        /// </summary>
-        /// <remarks>
-        /// In the event capacity is reached, calls to <see cref="IEmailSenderService.TryScheduleAsync(IEmailMessage, System.Threading.CancellationToken)"/>
-        /// will begin awaiting asynchronously until such capacity is available and only then return.
-        /// </remarks>
-        public int MessageQueueSize { get; set; } = 10_000;
-
-        /// <summary>
-        /// Callback to validate the server certificate.
-        /// </summary>
-        /// <remarks>
-        /// If no value is speicified, the default validation will be used.
-        /// </remarks>
-        public RemoteCertificateValidationCallback? ServerCertificateValidationCallback { get; set; }
 
         /// <summary>
         /// Set to <see langword="true"/> to treat emails with no recipients as successfully sent.
@@ -421,11 +387,6 @@ namespace ReconArt.Email
             if (FromAddress is not null && !ValidEmailAddressRegex().IsMatch(FromAddress))
             {
                 yield return new("From address is not a valid email address.", [nameof(FromAddress)]);
-            }
-
-            if (MessageQueueSize < 1 && MessageQueueSize != -1)
-            {
-                yield return new("MessageQueueSize must be greater than or equal to 1 or be set to unlimited capacity (-1).", [nameof(MessageQueueSize)]);
             }
         }
 

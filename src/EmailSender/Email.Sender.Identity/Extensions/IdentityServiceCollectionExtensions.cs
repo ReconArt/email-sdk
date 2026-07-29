@@ -18,15 +18,18 @@ namespace ReconArt.Email
         /// <br/><br/>
         /// <br/>If <paramref name="configuration"/> is <see langword="null"/>,
         /// the default values of <see cref="EmailSenderOptions"/> will be used and then overridden by <paramref name="configureOptions"/> (if any).
-        /// <br/>If <paramref name="configuration"/> is not <see langword="null"/>, 
+        /// <br/>If <paramref name="configuration"/> is not <see langword="null"/>,
         /// the options will be loaded from the configuration and then overridden by <paramref name="configureOptions"/> (if any).
-        /// <br/><br/> There is also a simpler method overload, 
-        /// if you wish to only load options via a delegate - <see cref="AddIdentityEmailSenderService(IServiceCollection, Action{EmailSenderOptions}?, bool)"/>.
+        /// <br/><br/><see cref="EmailSenderStartupOptions"/> follow the same pattern, using the <c>Startup</c> child section
+        /// of <paramref name="sectionName"/> and the <paramref name="configureStartupOptions"/> delegate.
+        /// <br/><br/> There is also a simpler method overload,
+        /// if you wish to only load options via a delegate - <see cref="AddIdentityEmailSenderService(IServiceCollection, Action{EmailSenderOptions}?, Action{EmailSenderStartupOptions}?, bool)"/>.
         /// </remarks>
         /// <param name="services">Service collection to use.</param>
         /// <param name="configuration">Configuration to read from, if any.</param>
         /// <param name="configureOptions">Optional delegate allowing you to override any settings loaded from the configuration.</param>
-        /// <param name="sectionName">Section name to use for loading the options from. 
+        /// <param name="configureStartupOptions">Optional delegate allowing you to override any startup settings loaded from the configuration.</param>
+        /// <param name="sectionName">Section name to use for loading the options from.
         /// Defaults to <see cref="EmailSenderOptions.SectionName"/>.</param>
         /// <param name="useBlockingIdentityService">When set to <see langword="false"/>, the identity implementation being used will schedule emails instead of awaiting them.</param>
         /// <returns>A reference to this instance after the operation has completed.</returns>
@@ -34,11 +37,12 @@ namespace ReconArt.Email
             this IServiceCollection services,
             IConfiguration? configuration,
             Action<EmailSenderOptions>? configureOptions = null,
+            Action<EmailSenderStartupOptions>? configureStartupOptions = null,
             string? sectionName = null,
             bool useBlockingIdentityService = false)
         {
             RegisterService(services, useBlockingIdentityService);
-            return ServiceCollectionExtensions.AddEmailSenderOptions(services, configuration, configureOptions, sectionName);
+            return ServiceCollectionExtensions.AddEmailSenderOptions(services, configuration, configureOptions, configureStartupOptions, sectionName);
         }
 
         /// <summary>
@@ -46,15 +50,17 @@ namespace ReconArt.Email
         /// </summary>
         /// <param name="services">Service collection to use.</param>
         /// <param name="configureOptions">Delegate to configure options, if any.</param>
+        /// <param name="configureStartupOptions">Delegate to configure startup options, if any.</param>
         /// <param name="useBlockingIdentityService">When set to <see langword="false"/>, the identity implementation being used will schedule emails instead of awaiting them.</param>
         /// <returns>A reference to this instance after the operation has completed.</returns>
         public static IServiceCollection AddIdentityEmailSenderService(
             this IServiceCollection services,
             Action<EmailSenderOptions>? configureOptions = null,
+            Action<EmailSenderStartupOptions>? configureStartupOptions = null,
             bool useBlockingIdentityService = false)
         {
             RegisterService(services, useBlockingIdentityService);
-            return ServiceCollectionExtensions.AddEmailSenderOptions(services, null, configureOptions);
+            return ServiceCollectionExtensions.AddEmailSenderOptions(services, null, configureOptions, configureStartupOptions);
         }
 
         private static void RegisterService(IServiceCollection services, bool useBlockingIdentityService)

@@ -70,9 +70,12 @@ internal sealed class TestRuntimeEmailSenderOptionsProvider(TestRuntimeMonitorDe
     public TestRuntimeMonitorDependency Dependency { get; } = dependency;
 
     public ValueTask<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellationToken) =>
-        ValueTask.FromResult<EmailSenderOptions?>(EmailSenderOptions.CreateBasic(
+        ValueTask.FromResult(GetOptions());
+
+    public EmailSenderOptions? GetOptions() =>
+        EmailSenderOptions.CreateBasic(
             host: "smtp.example.com",
             port: 25,
             requiresAuthentication: false,
-            fromAddress: "from@example.com"));
+            fromAddress: "from@example.com");
 }

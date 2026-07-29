@@ -917,6 +917,16 @@ internal sealed class TestEmailSenderOptionsProvider(EmailSenderOptions? options
         }
     }
 
+    public EmailSenderOptions? GetOptions()
+    {
+        OnGetOptions?.Invoke();
+
+        lock (_lock)
+        {
+            return _options;
+        }
+    }
+
     public void Set(EmailSenderOptions? options)
     {
         lock (_lock)

@@ -19,26 +19,30 @@ namespace ReconArt.Email
         /// <br/><br/>
         /// <br/>If <paramref name="configuration"/> is <see langword="null"/>,
         /// the default values of <see cref="EmailSenderOptions"/> will be used and then overridden by <paramref name="configureOptions"/> (if any).
-        /// <br/>If <paramref name="configuration"/> is not <see langword="null"/>, 
+        /// <br/>If <paramref name="configuration"/> is not <see langword="null"/>,
         /// the options will be loaded from the configuration and then overridden by <paramref name="configureOptions"/> (if any).
-        /// <br/><br/> There is also a simpler method overload, 
-        /// if you wish to only load options via a delegate - <see cref="AddEmailSenderService(IServiceCollection, Action{EmailSenderOptions}?)"/>.
+        /// <br/><br/><see cref="EmailSenderStartupOptions"/> follow the same pattern, using the <c>Startup</c> child section
+        /// of <paramref name="sectionName"/> and the <paramref name="configureStartupOptions"/> delegate.
+        /// <br/><br/> There is also a simpler method overload,
+        /// if you wish to only load options via a delegate - <see cref="AddEmailSenderService(IServiceCollection, Action{EmailSenderOptions}?, Action{EmailSenderStartupOptions}?)"/>.
         /// </remarks>
         /// <param name="services">Service collection to use.</param>
         /// <param name="configuration">Configuration to read from, if any.</param>
         /// <param name="configureOptions">Optional delegate allowing you to override any settings loaded from the configuration.</param>
-        /// <param name="sectionName">Section name to use for loading the <see cref="IEmailSenderService"/> options from. 
+        /// <param name="configureStartupOptions">Optional delegate allowing you to override any startup settings loaded from the configuration.</param>
+        /// <param name="sectionName">Section name to use for loading the <see cref="IEmailSenderService"/> options from.
         /// Defaults to <see cref="EmailSenderOptions.SectionName"/>.</param>
-        /// 
+        ///
         /// <returns>A reference to this instance after the operation has completed.</returns>
         public static IServiceCollection AddEmailSenderService(
             this IServiceCollection services,
             IConfiguration? configuration,
             Action<EmailSenderOptions>? configureOptions = null,
+            Action<EmailSenderStartupOptions>? configureStartupOptions = null,
             string? sectionName = null)
         {
             services.TryAddSingleton<IEmailSenderService, EmailSenderService>();
-            return AddEmailSenderOptions(services, configuration, configureOptions, sectionName);
+            return AddEmailSenderOptions(services, configuration, configureOptions, configureStartupOptions, sectionName);
         }
 
         /// <summary>
@@ -46,13 +50,15 @@ namespace ReconArt.Email
         /// </summary>
         /// <param name="services">Service collection to use.</param>
         /// <param name="configureOptions">Delegate to configure options, if any.</param>
+        /// <param name="configureStartupOptions">Delegate to configure startup options, if any.</param>
         /// <returns>A reference to this instance after the operation has completed.</returns>
         public static IServiceCollection AddEmailSenderService(
             this IServiceCollection services,
-            Action<EmailSenderOptions>? configureOptions = null)
+            Action<EmailSenderOptions>? configureOptions = null,
+            Action<EmailSenderStartupOptions>? configureStartupOptions = null)
         {
             services.TryAddSingleton<IEmailSenderService, EmailSenderService>();
-            return AddEmailSenderOptions(services, null, configureOptions);
+            return AddEmailSenderOptions(services, null, configureOptions, configureStartupOptions);
         }
 
         /// <summary>
@@ -63,8 +69,11 @@ namespace ReconArt.Email
         /// Must implement <see cref="IOptionsMonitor{TOptions}"/> for <see cref="EmailSenderOptions"/> or <see cref="IEmailSenderOptionsProvider"/>.
         /// </typeparam>
         /// <param name="services">Service collection to use.</param>
+        /// <param name="configureStartupOptions">Delegate to configure startup options, if any.</param>
         /// <returns>A reference to this instance after the operation has completed.</returns>
-        public static IServiceCollection AddEmailSenderService<TOptionsSource>(this IServiceCollection services)
+        public static IServiceCollection AddEmailSenderService<TOptionsSource>(
+            this IServiceCollection services,
+            Action<EmailSenderStartupOptions>? configureStartupOptions = null)
             where TOptionsSource : class
         {
             Type optionsSourceType = typeof(TOptionsSource);
@@ -74,11 +83,12 @@ namespace ReconArt.Email
             if (!isOptionsMonitor && !isOptionsProvider)
             {
                 throw new ArgumentException(
-                    $"{optionsSourceType.FullName} must implement {nameof(IOptionsMonitor<EmailSenderOptions>)} or {nameof(IEmailSenderOptionsProvider)}.",
+                    $"{optionsSourceType.FullName} must implement {nameof(IOptionsMonitor<TOptionsSource>)} or {nameof(IEmailSenderOptionsProvider)}.",
                     nameof(TOptionsSource));
             }
 
             services.TryAddSingleton<TOptionsSource>();
+            AddEmailSenderStartupOptions(services, null, configureStartupOptions);
 
             if (isOptionsProvider)
             {
@@ -87,6 +97,7 @@ namespace ReconArt.Email
                 services.TryAddSingleton<IEmailSenderService>(static provider =>
                     new EmailSenderService(
                         provider.GetRequiredService<IEmailSenderOptionsProvider>(),
+                        provider.GetRequiredService<IOptions<EmailSenderStartupOptions>>(),
                         provider.GetRequiredService<ILogger<EmailSenderService>>()));
             }
             else
@@ -100,21 +111,23 @@ namespace ReconArt.Email
         }
 
         /// <summary>
-        /// Adds <see cref="EmailSenderOptions"/> as an option in ASP.NET Core.
+        /// Adds <see cref="EmailSenderOptions"/> and <see cref="EmailSenderStartupOptions"/> as options in ASP.NET Core.
         /// </summary>
         /// <remarks>
-        /// This exists in the event you want to re-use the options class defined by this library in your own implementation, without registering the service.
+        /// This exists in the event you want to re-use the options classes defined by this library in your own implementation, without registering the service.
         /// </remarks>
         /// <param name="services">Service collection to use.</param>
         /// <param name="configuration">Configuration to read from, if any.</param>
         /// <param name="configureOptions">Optional delegate allowing you to override any settings loaded from the configuration.</param>
-        /// <param name="sectionName">Section name to use for loading the <see cref="IEmailSenderService"/> options from. 
-        /// Defaults to <see cref="EmailSenderOptions.SectionName"/>.</param>
+        /// <param name="configureStartupOptions">Optional delegate allowing you to override any startup settings loaded from the configuration.</param>
+        /// <param name="sectionName">Section name to use for loading the <see cref="IEmailSenderService"/> options from.
+        /// Defaults to <see cref="EmailSenderOptions.SectionName"/>. Startup options are loaded from its <c>Startup</c> child section.</param>
         /// <returns>A reference to this instance after the operation has completed.</returns>
         public static IServiceCollection AddEmailSenderOptions(
             this IServiceCollection services,
             IConfiguration? configuration,
             Action<EmailSenderOptions>? configureOptions = null,
+            Action<EmailSenderStartupOptions>? configureStartupOptions = null,
             string? sectionName = null)
         {
             var optionsBuilder = services.AddOptions<EmailSenderOptions>().ValidateDataAnnotations().ValidateOnStart();
@@ -127,6 +140,43 @@ namespace ReconArt.Email
             if (configureOptions is not null)
             {
                 optionsBuilder.Configure(configureOptions);
+            }
+
+            return AddEmailSenderStartupOptions(services, configuration, configureStartupOptions, sectionName);
+        }
+
+        /// <summary>
+        /// Adds <see cref="EmailSenderStartupOptions"/> as an option in ASP.NET Core.
+        /// </summary>
+        /// <remarks>
+        /// This exists in the event you want to re-use the options class defined by this library in your own implementation, without registering the service.
+        /// </remarks>
+        /// <param name="services">Service collection to use.</param>
+        /// <param name="configuration">Configuration to read from, if any.</param>
+        /// <param name="configureStartupOptions">Optional delegate allowing you to override any startup settings loaded from the configuration.</param>
+        /// <param name="sectionName">Section name the <see cref="IEmailSenderService"/> options are loaded from; startup options use its <c>Startup</c> child section.
+        /// Defaults to <see cref="EmailSenderOptions.SectionName"/>, i.e. startup options load from <see cref="EmailSenderStartupOptions.SectionName"/>.</param>
+        /// <returns>A reference to this instance after the operation has completed.</returns>
+        public static IServiceCollection AddEmailSenderStartupOptions(
+            this IServiceCollection services,
+            IConfiguration? configuration,
+            Action<EmailSenderStartupOptions>? configureStartupOptions = null,
+            string? sectionName = null)
+        {
+            var startupOptionsBuilder = services.AddOptions<EmailSenderStartupOptions>().ValidateDataAnnotations().ValidateOnStart();
+
+            if (configuration is not null)
+            {
+                string startupSectionName = sectionName is null
+                    ? EmailSenderStartupOptions.SectionName
+                    : sectionName + ":Startup";
+
+                startupOptionsBuilder.Bind(configuration.GetSection(startupSectionName));
+            }
+
+            if (configureStartupOptions is not null)
+            {
+                startupOptionsBuilder.Configure(configureStartupOptions);
             }
 
             return services;

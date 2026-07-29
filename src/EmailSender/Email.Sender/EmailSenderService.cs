@@ -10,6 +10,7 @@ using ReconArt.Email.Sender.Internal;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -33,89 +34,150 @@ namespace ReconArt.Email
         private const string INVALID_ADDRESS = "5.1.3 Invalid address";
         private const string SENDER_DENIED = "5.2.252 SendAsDenied";
 
-        private SmtpConnectionSlot[] _connectionSlots = Array.Empty<SmtpConnectionSlot>();
-        private bool[] _requiresReconnectBySlot = Array.Empty<bool>();
-        private ActionBlock<QueuedMail>? _emailScheduleWork;
-        private readonly SemaphoreSlim _configurationLock = new(1, 1);
-        private readonly SemaphoreSlim _oauthRefreshLock = new(1, 1);
-        private readonly Func<EmailSenderOptions, IEmailSmtpClient> _smtpClientFactory;
+        private readonly SmtpClient[] _connections;
+        private readonly int[] _connectionStatus; // 0=available, 1=in-use
+
+        // Slot i: the credential generation connection i last successfully authenticated with.
+        // Only ever accessed by the thread currently owning slot i via _connectionStatus.
+        private readonly ConnectionCredentials?[] _connectionCredentials;
 
         private readonly ILogger<EmailSenderService> _logger;
         private readonly IOptionsMonitor<EmailSenderOptions>? _mailOptions;
-        private readonly IEmailSenderOptionsProvider? _mailOptionsProvider;
-        private IDisposable? _optionsUpdateListener;
+        private readonly IEmailSenderOptionsProvider? _optionsProvider;
+        private readonly ActionBlock<QueuedMail> _emailScheduleWork;
+        private readonly EmailSenderStartupOptions _startupOptions;
 
+        // The currently-published credential generation. Swapped atomically, never mutated.
+        private ConnectionCredentials? _currentCredentials;
         private ParserOptions _cachedAddressParserOptions;
-        private EmailSenderOptions? _currentOptions;
         private int _failedMessagesCount;
         private bool _disposed;
 
         /// <summary>
         /// Creates an instance of <see cref="EmailSenderService"/>.
         /// </summary>
-        /// <param name="mailOptions">Email sender options.</param>
+        /// <param name="options">Email sender options.</param>
+        /// <param name="startupOptions">Email sender startup options.</param>
         /// <param name="logger">Email sender logger.</param>
-        public EmailSenderService(IOptionsMonitor<EmailSenderOptions> mailOptions, ILogger<EmailSenderService> logger)
-            : this(mailOptions, logger, static options => new MailKitSmtpClientAdapter(options.ServerCertificateValidationCallback))
+        public EmailSenderService(IOptionsMonitor<EmailSenderOptions> options, EmailSenderStartupOptions startupOptions, ILogger<EmailSenderService> logger)
+            : this(options, null, TransformEmailSenderStartupOptions(startupOptions), logger)
         {
         }
 
-        internal EmailSenderService(
-            IOptionsMonitor<EmailSenderOptions> mailOptions,
-            ILogger<EmailSenderService> logger,
-            Func<EmailSenderOptions, IEmailSmtpClient> smtpClientFactory)
+        /// <summary>
+        /// Creates an instance of <see cref="EmailSenderService"/>.
+        /// </summary>
+        /// <param name="options">Email sender options.</param>
+        /// <param name="startupOptions">Email sender startup options</param>
+        /// <param name="logger">Email sender logger.</param>
+        public EmailSenderService(IOptionsMonitor<EmailSenderOptions> options, IOptions<EmailSenderStartupOptions> startupOptions, ILogger<EmailSenderService> logger)
+            : this(options, null, startupOptions, logger)
         {
-            _mailOptions = mailOptions;
-            _logger = logger;
-            _smtpClientFactory = smtpClientFactory;
+        }
 
-            EmailSenderOptions options = mailOptions.CurrentValue;
-            _currentOptions = options;
-            InitializeInfrastructure(options);
+        /// <summary>
+        /// Creates an instance of <see cref="EmailSenderService"/>.
+        /// </summary>
+        /// <param name="options">Email sender options.</param>
+        /// <param name="startupOptions">Email sender startup options.</param>
+        /// <param name="configureLogger">
+        /// An optional action to configure the <see cref="ILoggerFactory"/> used by the <see cref="EmailSenderService"/>.
+        /// Leave <see langword="null"/> to effectively disable logging.
+        /// </param>
+        public EmailSenderService(EmailSenderOptions options, EmailSenderStartupOptions startupOptions, Action<ILoggingBuilder>? configureLogger = null)
+            : this(TransformEmailSenderOptions(options), startupOptions, InternalLoggerFactory.CreateLogger<EmailSenderService>(configureLogger))
+        {
+        }
+
+        /// <summary>
+        /// Creates an instance of <see cref="EmailSenderService"/>.
+        /// </summary>
+        /// <param name="optionsProvider">Email sender runtime options provider.</param>
+        /// <param name="startupOptions">Email sender startup options.</param>
+        /// <param name="configureLogger">
+        /// An optional action to configure the <see cref="ILoggerFactory"/> used by the <see cref="EmailSenderService"/>.
+        /// Leave <see langword="null"/> to effectively disable logging.
+        /// </param>
+        public EmailSenderService(IEmailSenderOptionsProvider optionsProvider, EmailSenderStartupOptions startupOptions, Action<ILoggingBuilder>? configureLogger = null)
+            : this(null, optionsProvider, TransformEmailSenderStartupOptions(startupOptions), InternalLoggerFactory.CreateLogger<EmailSenderService>(configureLogger))
+        {
+        }
+
+        /// <summary>
+        /// Creates an instance of <see cref="EmailSenderService"/>.
+        /// </summary>
+        /// <param name="optionsProvider">Email sender runtime options provider.</param>
+        /// <param name="startupOptions">Email sender startup options.</param>
+        /// <param name="logger">Email sender logger.</param>
+        public EmailSenderService(IEmailSenderOptionsProvider optionsProvider, IOptions<EmailSenderStartupOptions> startupOptions, ILogger<EmailSenderService> logger)
+            : this(null, optionsProvider, startupOptions, logger)
+        {
+        }
+
+
+        internal EmailSenderService(
+            IOptionsMonitor<EmailSenderOptions>? mailOptions,
+            IEmailSenderOptionsProvider? mailOptionsProvider,
+            IOptions<EmailSenderStartupOptions> startupOptions,
+            ILogger<EmailSenderService> logger)
+        {
+            if (mailOptionsProvider is not null && mailOptions is not null)
+            {
+                throw new InvalidOperationException($"Cannot create an instance of type {typeof(EmailSenderService).FullName} with a mixed-configuration truth." +
+                    $" If you see this, contact the developer.");
+            }
+            if (mailOptions is null)
+            {
+                if (mailOptionsProvider is null)
+                {
+                    throw new InvalidOperationException($"Either {nameof(mailOptions)} or {nameof(mailOptionsProvider)} must have a non-null value.");
+                }
+            }
+
+            EmailSenderStartupOptions startupConfigurationOptions = startupOptions.Value;
+            // Validate on every path: the IOptions-based constructors would otherwise accept
+            // values (e.g. MaxConcurrentConnections = 0) that permanently fault the ActionBlock.
+            ObjectValidator.ValidateObjectOrThrow(startupConfigurationOptions);
+            _startupOptions = startupConfigurationOptions;
+            _mailOptions = mailOptions;
+            _optionsProvider = mailOptionsProvider;
+            _logger = logger;
+            _emailScheduleWork = new ActionBlock<QueuedMail>(ProcessMessageAsync, new ExecutionDataflowBlockOptions
+            {
+                EnsureOrdered = false,
+                MaxDegreeOfParallelism = Math.Max(startupConfigurationOptions.MaxConcurrentConnections, 1),
+                SingleProducerConstrained = false,
+                TaskScheduler = TaskScheduler.Default,
+                BoundedCapacity = startupConfigurationOptions.MessageQueueSize
+            });
+
+            SmtpClient[] connections = new SmtpClient[startupConfigurationOptions.MaxConcurrentConnections];
+            for (int i = 0; i < connections.Length; i++)
+            {
+                SmtpClient client = new();
+                if (startupConfigurationOptions.ServerCertificateValidationCallback is not null)
+                {
+                    client.ServerCertificateValidationCallback = startupConfigurationOptions.ServerCertificateValidationCallback;
+                }
+
+                connections[i] = client;
+            }
+
+            _connections = connections;
+            _connectionStatus = new int[connections.Length];
+            // All-null slots read as "never authenticated" - first acquisition authenticates.
+            _connectionCredentials = new ConnectionCredentials?[connections.Length];
 
             try
             {
-                _optionsUpdateListener = mailOptions.OnChange(UpdateParserOptions);
-                _cachedAddressParserOptions = CreateParserOptions(mailOptions.CurrentValue);
+                _cachedAddressParserOptions = mailOptions is not null
+                    ? CreateParserOptions(mailOptions.CurrentValue)
+                    : CreateParserOptions(new());
             }
             catch
             {
                 _cachedAddressParserOptions = CreateParserOptions(new());
             }
-        }
-
-        /// <summary>
-        /// Creates an instance of <see cref="EmailSenderService"/>.
-        /// </summary>
-        /// <param name="mailOptionsProvider">Email sender runtime options provider.</param>
-        /// <param name="logger">Email sender logger.</param>
-        public EmailSenderService(IEmailSenderOptionsProvider mailOptionsProvider, ILogger<EmailSenderService> logger)
-            : this(mailOptionsProvider, logger, static options => new MailKitSmtpClientAdapter(options.ServerCertificateValidationCallback))
-        {
-        }
-
-        internal EmailSenderService(
-            IEmailSenderOptionsProvider mailOptionsProvider,
-            ILogger<EmailSenderService> logger,
-            Func<EmailSenderOptions, IEmailSmtpClient> smtpClientFactory)
-        {
-            _mailOptionsProvider = mailOptionsProvider;
-            _logger = logger;
-            _smtpClientFactory = smtpClientFactory;
-            _cachedAddressParserOptions = CreateParserOptions(new());
-        }
-
-        /// <summary>
-        /// Creates an instance of <see cref="EmailSenderService"/>.
-        /// </summary>
-        /// <param name="mailOptions">Email sender options.</param>
-        /// <param name="configureLogger">
-        /// An optional action to configure the <see cref="ILoggerFactory"/> used by the <see cref="EmailSenderService"/>.
-        /// Leave <see langword="null"/> to effectively disable logging.
-        /// </param>
-        public EmailSenderService(EmailSenderOptions mailOptions, Action<ILoggingBuilder>? configureLogger = null)
-            : this(TransformEmailSenderOptions(mailOptions), InternalLoggerFactory.CreateLogger<EmailSenderService>(configureLogger))
-        {
         }
 
         #region Public_Methods
@@ -133,48 +195,38 @@ namespace ReconArt.Email
         {
             try
             {
-                EmailSenderOptions? options = await FetchCurrentOptionsAsync(cancellationToken).ConfigureAwait(false);
+                EmailSenderOptions? options = await GetOptionsAsync(cancellationToken).ConfigureAwait(false);
                 if (options is null)
                 {
                     return new InvalidOperationException("Email sender is not configured.");
                 }
 
-                IEmailSmtpClient client = _smtpClientFactory(options);
+                EmailSenderStartupOptions startupOptions = _startupOptions;
+                SmtpClient client = new();
+                if (startupOptions.ServerCertificateValidationCallback is not null)
+                {
+                    client.ServerCertificateValidationCallback = startupOptions.ServerCertificateValidationCallback;
+                }
 
                 try
                 {
-                    bool refreshedAfterFailure = false;
-                    while (true)
+                    await client.ConnectAsync(options.Host, options.Port, SecureSocketOptions.Auto, cancellationToken)
+                        .ConfigureAwait(false);
+
+                    if (options.RequiresAuthentication)
                     {
-                        string? previousAccessToken = options.AccessToken;
-                        DateTime? previousAccessTokenExpiresAtUtc = options.AccessTokenExpiresAtUtc;
-                        SmtpClientConnectionResult result =
-                            await TryToConnectAndAuthenticateSmtpClientAsync(options, client, null, cancellationToken).ConfigureAwait(false);
-                        if (result.Successful)
-                        {
-                            return null;
-                        }
-
-                        if (result.ShouldRefreshOAuthToken
-                            && !refreshedAfterFailure
-                            && await TryRefreshOAuthTokenAndReconnectAsync(
-                                options,
-                                null,
-                                client,
-                                cancellationToken,
-                                previousAccessToken,
-                                previousAccessTokenExpiresAtUtc).ConfigureAwait(false))
-                        {
-                            refreshedAfterFailure = true;
-                            continue;
-                        }
-
-                        return result.Exception ?? new InvalidOperationException("Could not connect to the SMTP server.");
+                        await client.AuthenticateAsync(options.Username ?? string.Empty, options.Password ?? string.Empty, cancellationToken)
+                            .ConfigureAwait(false);
                     }
+
+                    return null;
                 }
                 finally
                 {
-                    await DisconnectSmtpClientAsync(client).ConfigureAwait(false);
+                    // Do not pass the cancellation token. We want to disconnect gracefully.
+#pragma warning disable CA2016 // Forward the 'CancellationToken' parameter to methods
+                    await client.DisconnectAsync(true).ConfigureAwait(false);
+#pragma warning restore CA2016 // Forward the 'CancellationToken' parameter to methods
                     client.Dispose();
                 }
             }
@@ -220,24 +272,35 @@ namespace ReconArt.Email
 
             try
             {
-                _optionsUpdateListener?.Dispose();
-
-                ActionBlock<QueuedMail>? emailScheduleWork = _emailScheduleWork;
-                if (emailScheduleWork is not null)
+                _emailScheduleWork.Complete();
+                try
                 {
-                    emailScheduleWork.Complete();
-                    await emailScheduleWork.Completion.ConfigureAwait(false);
+                    await _emailScheduleWork.Completion.ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // A faulted block must not prevent the pool below from being disposed.
+                    _logger.LogError(ex, "Email processing stopped with an error.");
                 }
 
-                for (int i = 0; i < _connectionSlots.Length; i++)
+                for (int i = 0; i < _connections.Length; i++)
                 {
-                    SmtpConnectionSlot slot = _connectionSlots[i];
-                    await DisconnectConnectionSlotAsync(slot).ConfigureAwait(false);
-                    slot.Client.Dispose();
-                }
+                    SmtpClient smtpClient = _connections[i];
 
-                _oauthRefreshLock.Dispose();
-                _configurationLock.Dispose();
+                    try
+                    {
+                        await smtpClient.DisconnectAsync(true).ConfigureAwait(false);
+                    }
+                    catch (Exception ex)
+                    {
+                        // One broken session must not abandon disposal of the rest of the pool.
+                        _logger.LogError(ex, "Could not gracefully disconnect an SMTP connection during dispose.");
+                    }
+                    finally
+                    {
+                        smtpClient.Dispose();
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -253,9 +316,7 @@ namespace ReconArt.Email
 
         #region Private_Methods
 
-        private async ValueTask<bool> InternalTryScheduleAsync(IEmailMessage email,
-            bool awaitCompletion,
-            CancellationToken cancellationToken)
+        private async ValueTask<bool> InternalTryScheduleAsync(IEmailMessage email, bool awaitCompletion, CancellationToken cancellationToken)
         {
             if (cancellationToken.IsCancellationRequested)
             {
@@ -292,16 +353,7 @@ namespace ReconArt.Email
             bool queued;
             try
             {
-                ActionBlock<QueuedMail>? emailScheduleWork = _emailScheduleWork;
-                if (emailScheduleWork is null)
-                {
-                    _logger.LogError("Email message could not be processed because the sender runtime was not initialized.");
-                    await OnEmailSendingFailureAsync(email, mailOptions, EmailFailureReason.Unknown).ConfigureAwait(false);
-                    queuedMail.Dispose();
-                    return false;
-                }
-
-                queued = await emailScheduleWork.SendAsync(queuedMail, cancellationToken).ConfigureAwait(false);
+                queued = await _emailScheduleWork.SendAsync(queuedMail, cancellationToken).ConfigureAwait(false);
             }
             catch when (ExceptionFilters.DisposeWithoutUnwindingStack(queuedMail))
             {
@@ -310,7 +362,8 @@ namespace ReconArt.Email
 
             if (!queued)
             {
-                _logger.LogError("Email message could not be processed. Service has stopped accepting new email messages.");
+                _logger.LogError("Email message could not be processed. " +
+                    "Service has stopped accepting new email messages.");
 
                 await OnEmailSendingFailureAsync(email, mailOptions, EmailFailureReason.Unknown).ConfigureAwait(false);
                 queuedMail.Dispose();
@@ -319,14 +372,13 @@ namespace ReconArt.Email
             }
 
             _logger.LogInformation("Email to {Recipients} has been scheduled for sending.",
-                string.Join(", ", mimeMessage.To.Cast<MailboxAddress>().Select(static adr => adr.Address)));
+                string.Join(", ",
+                    mimeMessage.To.Cast<MailboxAddress>().Select(static adr => adr.Address)));
 
             return !awaitCompletion || await queuedMail.TaskCompletionSource!.Task.ConfigureAwait(false);
         }
 
-        private MimeMessage? CreateMimeMessage(IEmailMessage email,
-            EmailSenderOptions mailOptions,
-            out bool treatAsSuccess)
+        private MimeMessage? CreateMimeMessage(IEmailMessage email, EmailSenderOptions mailOptions, out bool treatAsSuccess)
         {
             treatAsSuccess = false;
             try
@@ -409,7 +461,7 @@ namespace ReconArt.Email
                     StringBuilder bodyBuilder = new();
                     bodyBuilder.Append(emailBody);
 
-                    foreach (IEmailAttachment attachment in email.Attachments)
+                    foreach (var attachment in email.Attachments)
                     {
                         if (attachment.Placeholder is not null)
                         {
@@ -460,7 +512,7 @@ namespace ReconArt.Email
                 MailboxAddress? fromAddress = null;
                 MailboxAddress? senderAddress = null;
 
-                if (UsesAuthenticatedIdentity(mailOptions) && mailOptions.IsUsernameEmailAddress)
+                if (mailOptions.RequiresAuthentication && mailOptions.IsUsernameEmailAddress)
                 {
                     // Defensive check. Under normal conditions should never be hit.
                     if (string.IsNullOrWhiteSpace(mailOptions.Username))
@@ -471,26 +523,18 @@ namespace ReconArt.Email
 
                     if (mailOptions.FromAddress is not null && mailOptions.FromAddress != mailOptions.Username)
                     {
-                        if (!TryParseEmailAddress(mailOptions.FromAddress, "From", out MailboxAddress parsedFromAddress))
+                        if (!TryParseEmailAddress(mailOptions.FromAddress, "From", out fromAddress))
                         {
                             return null;
                         }
-
-                        if (!TryParseEmailAddress(mailOptions.Username, "Sender", out MailboxAddress parsedSenderAddress))
+                        if (!TryParseEmailAddress(mailOptions.Username, "Sender", out senderAddress))
                         {
                             return null;
                         }
-
-                        fromAddress = parsedFromAddress;
-                        senderAddress = parsedSenderAddress;
                     }
-                    else if (!TryParseEmailAddress(mailOptions.Username, "From", out MailboxAddress parsedFromAddress))
+                    else if (!TryParseEmailAddress(mailOptions.Username, "From", out fromAddress))
                     {
                         return null;
-                    }
-                    else
-                    {
-                        fromAddress = parsedFromAddress;
                     }
                 }
                 else
@@ -503,12 +547,10 @@ namespace ReconArt.Email
                         return null;
                     }
 
-                    if (!TryParseEmailAddress(mailOptions.FromAddress, "From", out MailboxAddress parsedFromAddress))
+                    if (!TryParseEmailAddress(mailOptions.FromAddress, "From", out fromAddress))
                     {
                         return null;
                     }
-
-                    fromAddress = parsedFromAddress;
                 }
 
                 mail.From.Add(fromAddress);
@@ -519,9 +561,9 @@ namespace ReconArt.Email
 
                 foreach (string recipient in filteredRecipients)
                 {
-                    if (MailboxAddress.TryParse(_cachedAddressParserOptions, recipient, out MailboxAddress? emailAddress) && emailAddress is not null)
+                    if (MailboxAddress.TryParse(_cachedAddressParserOptions, recipient, out MailboxAddress? emailAdress))
                     {
-                        mail.To.Add(emailAddress);
+                        mail.To.Add(emailAdress);
                     }
                     else
                     {
@@ -533,16 +575,18 @@ namespace ReconArt.Email
                 {
                     return mail;
                 }
-
-                if (mailOptions.TreatEmptyRecipientsAsSuccess)
+                else
                 {
-                    _logger.LogInformation("An email with invalid recipient addresses was treated as successfully processed.");
-                    treatAsSuccess = true;
+                    if (mailOptions.TreatEmptyRecipientsAsSuccess)
+                    {
+                        _logger.LogInformation("An email with invalid recipient addresses was treated as successfully processed.");
+                        treatAsSuccess = true;
+                        return null;
+                    }
+
+                    _logger.LogWarning("Email will not be processed because all remaining recipients had invalid addresses.");
                     return null;
                 }
-
-                _logger.LogWarning("Email will not be processed because all remaining recipients had invalid addresses.");
-                return null;
             }
             catch (Exception ex)
             {
@@ -551,85 +595,55 @@ namespace ReconArt.Email
             }
         }
 
-        private async ValueTask<SmtpClientConnectionResult> TryToConnectAndAuthenticateSmtpClientAsync(
-            EmailSenderOptions options,
-            IEmailSmtpClient smtpClient,
-            SmtpConnectionSlot? connectionSlot,
+        private async ValueTask<bool> TryToConnectAndAuthenticateSmtpClientAsync(
+            ConnectionCredentials credentials,
+            int connectionIndex,
+            SmtpClient smtpClient,
             CancellationToken cancellationToken)
         {
-            EmailSenderOptions effectiveOptions = options;
-
             try
             {
-                if (connectionSlot is not null)
+                // Staleness is derived, not recorded: the session is stale exactly when it last
+                // authenticated against a different credentials generation than the one this
+                // message was acquired with. We own the slot, so a plain read is safe.
+                if (!ReferenceEquals(_connectionCredentials[connectionIndex], credentials) && smtpClient.IsConnected)
                 {
-                    (smtpClient, effectiveOptions) =
-                        await EnsureConnectionSlotRuntimeMatchesOptionsAsync(connectionSlot, options, cancellationToken).ConfigureAwait(false);
-                }
-
-                if (effectiveOptions.AuthenticationType == EmailSenderAuthenticationType.OAuth2)
-                {
-                    await EnsureValidOAuthAccessTokenAsync(effectiveOptions, cancellationToken).ConfigureAwait(false);
-                    if (connectionSlot is not null && IsConnectionSlotReconnectRequired(connectionSlot))
-                    {
-                        (smtpClient, effectiveOptions) =
-                            await EnsureConnectionSlotRuntimeMatchesOptionsAsync(connectionSlot, effectiveOptions, cancellationToken).ConfigureAwait(false);
-                    }
+                    // A stale session cannot be re-authenticated in place - MailKit throws on an
+                    // already-authenticated session, and a host/port change needs a fresh socket
+                    // regardless. Tear down and rebuild.
+                    await smtpClient.DisconnectAsync(quit: true, cancellationToken).ConfigureAwait(false);
                 }
 
                 if (!smtpClient.IsConnected)
                 {
-                    await smtpClient.ConnectAsync(effectiveOptions.Host, effectiveOptions.Port, SecureSocketOptions.Auto, cancellationToken).ConfigureAwait(false);
+                    await smtpClient.ConnectAsync(credentials.Host, credentials.Port, SecureSocketOptions.Auto, cancellationToken: cancellationToken)
+                        .ConfigureAwait(false);
                 }
 
-                if (effectiveOptions.AuthenticationType == EmailSenderAuthenticationType.Basic)
+                if (credentials.RequiresAuthentication && !smtpClient.IsAuthenticated)
                 {
-                    if (effectiveOptions.RequiresAuthentication && !smtpClient.IsAuthenticated)
-                    {
-                        await smtpClient.AuthenticateAsync(effectiveOptions.Username ?? string.Empty, effectiveOptions.Password ?? string.Empty, cancellationToken)
-                            .ConfigureAwait(false);
-                    }
-                }
-                else
-                {
-                    if (!smtpClient.IsAuthenticated)
-                    {
-                        string accessToken = effectiveOptions.AccessToken ?? string.Empty;
-                        SaslMechanismOAuth2 oauthMechanism = new(effectiveOptions.Username ?? string.Empty, accessToken);
-                        await smtpClient.AuthenticateAsync(oauthMechanism, cancellationToken).ConfigureAwait(false);
-                        if (connectionSlot is not null)
-                        {
-                            ClearConnectionSlotReconnectRequired(connectionSlot);
-                        }
-                    }
+                    await smtpClient.AuthenticateAsync(credentials.Username ?? string.Empty, credentials.Password ?? string.Empty, cancellationToken)
+                        .ConfigureAwait(false);
                 }
 
-                if (connectionSlot is not null)
-                {
-                    ClearConnectionSlotReconnectRequired(connectionSlot);
-                }
+                // Record the generation only on full success: cancel or fail halfway and the slot
+                // keeps its old (or null) reference, so the next owner sees a mismatch and
+                // rebuilds - half-connected sessions self-heal. A plain write is safe - we own
+                // the slot; the Interlocked handoff in ReleaseConnection publishes it onward.
+                _connectionCredentials[connectionIndex] = credentials;
             }
             catch (OperationCanceledException) when (LogOperationCancelledWithoutUnwinding(_logger))
             {
+                // Honor typical async patterns, by keeping cancellation as an exception.
                 throw;
-            }
-            catch (Exception ex) when (effectiveOptions.AuthenticationType == EmailSenderAuthenticationType.OAuth2 && IsRefreshableAuthenticationException(ex))
-            {
-                _logger.LogWarning(ex, "OAuth2 authentication failed. A token refresh will be attempted.");
-                return new(false, true, EmailFailureReason.AuthenticationFailed, ex, effectiveOptions);
-            }
-            catch (Exception ex) when (IsAuthenticationFailure(ex))
-            {
-                _logger.LogCritical(ex, "Authentication with the SMTP server failed.");
-                return new(false, false, EmailFailureReason.AuthenticationFailed, ex, effectiveOptions);
             }
             catch (Exception ex)
             {
                 _logger.LogCritical(ex, "Critical error in connecting to SMTP server.");
-                return new(false, false, EmailFailureReason.Unknown, ex, effectiveOptions);
+                return false;
             }
 
-            return new(true, false, EmailFailureReason.None, null, effectiveOptions);
+            return true;
         }
 
         private async Task<bool> ProcessMessageAsync(QueuedMail queuedMail)
@@ -637,28 +651,29 @@ namespace ReconArt.Email
             try
             {
                 bool wasDisposed = false;
-                _logger.LogInformation("Message for {Recipients} is being processed...", string.Join(", ",
-                    queuedMail.MimeMessage.To.Cast<MailboxAddress>().Select(static adr => adr.Address)));
+                EmailSenderOptions? mailOptions;
+                var recipientsFormatted = string.Join(", ", 
+                    queuedMail.MimeMessage.To.Cast<MailboxAddress>().Select(static adr => adr.Address));
 
-                EmailSenderOptions? mailOptions = await GetOptionsAsync(queuedMail.CancellationToken).ConfigureAwait(false);
+                _logger.LogInformation("Message for {Recipients} is being processed...", recipientsFormatted);
+                mailOptions = await GetOptionsAsync(queuedMail.CancellationToken).ConfigureAwait(false);
                 if (mailOptions is null)
                 {
+                    _logger.LogInformation(
+                        "Message for {Recipients} could not be processed - no SMTP configuration could be retrieived.",
+                        recipientsFormatted);
+
                     Interlocked.Increment(ref _failedMessagesCount);
                     return false;
                 }
 
-                EmailSenderOptions effectiveMailOptions = mailOptions;
-
-                SmtpConnectionSlot connectionSlot = GetConnection();
+                (SmtpClient smtpClient, int connectionIndex, ConnectionCredentials credentials, bool requiresReauthentication) = GetConnection();
                 try
                 {
                     try
                     {
-                        (IEmailSmtpClient smtpClient, effectiveMailOptions) =
-                            await EnsureConnectionSlotRuntimeMatchesOptionsAsync(connectionSlot, effectiveMailOptions, queuedMail.CancellationToken)
-                                .ConfigureAwait(false);
-
-                        if (smtpClient.IsConnected)
+                        // No point probing a session that is about to be torn down and rebuilt.
+                        if (!requiresReauthentication && smtpClient.IsConnected)
                         {
                             await smtpClient.NoOpAsync(queuedMail.CancellationToken).ConfigureAwait(false);
                         }
@@ -670,6 +685,7 @@ namespace ReconArt.Email
                     }
                     catch (OperationCanceledException) when (LogOperationCancelledWithoutUnwinding(_logger))
                     {
+                        // Honor typical async patterns, by keeping cancellation as an exception.
                         throw;
                     }
                     catch
@@ -678,12 +694,12 @@ namespace ReconArt.Email
                     }
 
                     return wasDisposed
-                        ? await OnEmailSendingFailureAsync(queuedMail.Message, effectiveMailOptions, EmailFailureReason.Disposed).ConfigureAwait(false)
-                        : await SendMessageAsync(connectionSlot, queuedMail, effectiveMailOptions).ConfigureAwait(false);
+                        ? await OnEmailSendingFailureAsync(queuedMail.Message, mailOptions, EmailFailureReason.Disposed).ConfigureAwait(false)
+                        : await SendMessageAsync(smtpClient, connectionIndex, credentials, queuedMail, mailOptions).ConfigureAwait(false);
                 }
                 finally
                 {
-                    ReleaseConnection(connectionSlot);
+                    ReleaseConnection(connectionIndex);
                 }
             }
             finally
@@ -692,30 +708,31 @@ namespace ReconArt.Email
             }
         }
 
-        private bool TryParseEmailAddress(string address, string headerType, out MailboxAddress parsedAddress)
+        private bool TryParseEmailAddress(string address, string headerType, [NotNullWhen(true)] out MailboxAddress? parsedAddress)
         {
-            if (!MailboxAddress.TryParse(_cachedAddressParserOptions, address, out MailboxAddress? candidateAddress)
-                || candidateAddress is null)
+            if (!MailboxAddress.TryParse(_cachedAddressParserOptions, address, out parsedAddress))
             {
-                parsedAddress = null!;
                 _logger.LogCritical("Failed to parse {Address} as an email address for the \"{HeaderType}\" header.", address, headerType);
                 return false;
             }
-
-            parsedAddress = candidateAddress;
             return true;
         }
 
-        private SmtpConnectionSlot GetConnection()
+        private (SmtpClient Client, int Index, ConnectionCredentials Credentials, bool RequiresReauthentication) GetConnection()
         {
             // Find the closest or "hottest" available connection.
-            for (int i = 0; i < _connectionSlots.Length; i++)
+            for (int i = 0; i < _connections.Length; i++)
             {
-                SmtpConnectionSlot slot = _connectionSlots[i];
                 // Try to acquire the connection by marking it as in-use atomically.
-                if (Interlocked.CompareExchange(ref slot.InUse, 1, 0) == 0)
+                if (Interlocked.CompareExchange(ref _connectionStatus[i], 1, 0) == 0)
                 {
-                    return slot;
+                    // Acquire paired with the release in RefreshConnectionInfo: observing the new
+                    // reference guarantees observing the record's fully-initialized fields.
+                    ConnectionCredentials? current = Volatile.Read(ref _currentCredentials);
+                    Debug.Assert(current is not null,
+                        "Connections are only acquired after a successful options fetch, which publishes a credentials snapshot.");
+
+                    return (_connections[i], i, current!, !ReferenceEquals(_connectionCredentials[i], current));
                 }
             }
 
@@ -726,139 +743,23 @@ namespace ReconArt.Email
             throw new InvalidOperationException("No SMTP connections available.");
         }
 
-        private void ReleaseConnection(SmtpConnectionSlot slot)
+        private void ReleaseConnection(int index)
         {
             // Simply mark as available
-            Interlocked.Exchange(ref slot.InUse, 0);
+            Interlocked.Exchange(ref _connectionStatus[index], 0);
         }
 
-        private async ValueTask<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellationToken)
-        {
-            try
-            {
-                return await FetchCurrentOptionsAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogCritical(ex, "Could not fetch mail options.");
-                return null;
-            }
-        }
-
-        private async ValueTask<EmailSenderOptions?> FetchCurrentOptionsAsync(CancellationToken cancellationToken)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-
-            EmailSenderOptions? options = _mailOptionsProvider is not null
-                ? await _mailOptionsProvider.GetOptionsAsync(cancellationToken).ConfigureAwait(false)
-                : _mailOptions!.CurrentValue;
-
-            if (options is null)
-            {
-                await ApplyUnavailableOptionsAsync(cancellationToken).ConfigureAwait(false);
-                return null;
-            }
-
-            ObjectValidator.ValidateObjectOrThrow(options);
-
-            await _configurationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                EmailSenderOptions? previousOptions = _currentOptions;
-                bool requiresReconnect = previousOptions is null || !HaveSameSmtpRuntimeOptions(previousOptions, options);
-                bool infrastructureAlreadyInitialized = _emailScheduleWork is not null && _connectionSlots.Length != 0;
-
-                _currentOptions = options;
-                _cachedAddressParserOptions = CreateParserOptions(options);
-                InitializeInfrastructure(options);
-
-                if (requiresReconnect && infrastructureAlreadyInitialized)
-                {
-                    MarkAllConnectionSlotsForReconnect();
-                }
-
-                return _currentOptions;
-            }
-            finally
-            {
-                _configurationLock.Release();
-            }
-        }
-
-        private async ValueTask ApplyUnavailableOptionsAsync(CancellationToken cancellationToken)
-        {
-            await _configurationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
-            {
-                _currentOptions = null;
-                _cachedAddressParserOptions = CreateParserOptions(new());
-                MarkAllConnectionSlotsForReconnect();
-            }
-            finally
-            {
-                _configurationLock.Release();
-            }
-        }
-
-        private void InitializeInfrastructure(EmailSenderOptions options)
-        {
-            if (_emailScheduleWork is not null && _connectionSlots.Length != 0)
-            {
-                return;
-            }
-
-            int connectionCount = Math.Max(options.MaxConcurrentConnections, 1);
-            _emailScheduleWork = new ActionBlock<QueuedMail>(ProcessMessageAsync, new ExecutionDataflowBlockOptions
-            {
-                EnsureOrdered = false,
-                MaxDegreeOfParallelism = connectionCount,
-                SingleProducerConstrained = false,
-                TaskScheduler = TaskScheduler.Default,
-                BoundedCapacity = options.MessageQueueSize
-            });
-
-            SmtpConnectionSlot[] connectionSlots = new SmtpConnectionSlot[connectionCount];
-            for (int i = 0; i < connectionSlots.Length; i++)
-            {
-                connectionSlots[i] = new SmtpConnectionSlot
-                {
-                    Index = i,
-                    Client = _smtpClientFactory(options)
-                };
-            }
-
-            _connectionSlots = connectionSlots;
-            _requiresReconnectBySlot = new bool[connectionCount];
-        }
-
-        private async ValueTask<(IEmailSmtpClient Client, EmailSenderOptions Options)> EnsureConnectionSlotRuntimeMatchesOptionsAsync(
-            SmtpConnectionSlot connectionSlot,
-            EmailSenderOptions options,
-            CancellationToken cancellationToken)
-        {
-            EmailSenderOptions effectiveOptions = _currentOptions ?? options;
-            if (!IsConnectionSlotReconnectRequired(connectionSlot))
-            {
-                return (connectionSlot.Client, effectiveOptions);
-            }
-
-            cancellationToken.ThrowIfCancellationRequested();
-
-            await DisconnectSmtpClientAsync(connectionSlot.Client).ConfigureAwait(false);
-            if (connectionSlot.Client is MailKitSmtpClientAdapter mailKitClient)
-            {
-                mailKitClient.UpdateServerCertificateValidationCallback(effectiveOptions.ServerCertificateValidationCallback);
-            }
-
-            return (connectionSlot.Client, effectiveOptions);
-        }
-
-        private async Task<bool> SendMessageAsync(SmtpConnectionSlot connectionSlot, QueuedMail queuedMail, EmailSenderOptions mailOptions)
+        private async Task<bool> SendMessageAsync(
+            SmtpClient smtpClient,
+            int connectionIndex,
+            ConnectionCredentials credentials,
+            QueuedMail queuedMail,
+            EmailSenderOptions mailOptions)
         {
             EmailFailureReason failureReason = EmailFailureReason.Unknown;
             CancellationToken cancellationToken = queuedMail.CancellationToken;
-            bool refreshedAfterFailure = false;
 
+            // To add some resiliency, we'll attempt to send the message a couple of times before giving up.
             int retryCount = mailOptions.RetryCount;
             IEnumerator<TimeSpan> delaysEnumerator = mailOptions.RetryDelayInMilliseconds <= 0 || retryCount <= 0
                 ? Enumerable.Empty<TimeSpan>().GetEnumerator()
@@ -869,47 +770,22 @@ namespace ReconArt.Email
             {
                 do
                 {
-                    IEmailSmtpClient smtpClient = connectionSlot.Client;
-                    SmtpClientConnectionResult connectionResult =
-                        await TryToConnectAndAuthenticateSmtpClientAsync(mailOptions, smtpClient, connectionSlot, cancellationToken).ConfigureAwait(false);
-                    mailOptions = connectionResult.EffectiveOptions;
-                    if (connectionResult.Successful)
+                    if (await TryToConnectAndAuthenticateSmtpClientAsync(credentials, connectionIndex, smtpClient, cancellationToken).ConfigureAwait(false))
                     {
-                        smtpClient = connectionSlot.Client;
-                        SmtpSendResult sendResult =
-                            await TrySendingSmtpClientMailMessageAsync(smtpClient, queuedMail.MimeMessage, mailOptions, cancellationToken).ConfigureAwait(false);
+                        (bool Successful, bool FailFast, EmailFailureReason FailureReason) result =
+                            await TrySendingSmtpClientMailMessageAsync(smtpClient, queuedMail.MimeMessage, cancellationToken).ConfigureAwait(false);
 
-                        if (sendResult.Successful)
+                        if (result.Successful)
                         {
                             queuedMail.Delivered();
                             return true;
                         }
 
-                        failureReason = sendResult.FailureReason;
+                        failureReason = result.FailureReason;
 
-                        if (sendResult.ShouldRefreshOAuthToken
-                            && !refreshedAfterFailure
-                            && await TryRefreshOAuthTokenAndReconnectAsync(mailOptions, connectionSlot, null, cancellationToken).ConfigureAwait(false))
-                        {
-                            refreshedAfterFailure = true;
-                            continue;
-                        }
-
-                        if (sendResult.FailFast)
+                        if (result.FailFast)
                         {
                             break;
-                        }
-                    }
-                    else
-                    {
-                        failureReason = connectionResult.FailureReason;
-
-                        if (connectionResult.ShouldRefreshOAuthToken
-                            && !refreshedAfterFailure
-                            && await TryRefreshOAuthTokenAndReconnectAsync(mailOptions, connectionSlot, null, cancellationToken).ConfigureAwait(false))
-                        {
-                            refreshedAfterFailure = true;
-                            continue;
                         }
                     }
 
@@ -921,7 +797,7 @@ namespace ReconArt.Email
 
                     TimeSpan retryDelay = delaysEnumerator.Current;
 
-                    _logger.LogInformation("Retrying in {RetryMailDelay}ms to send a message.", retryDelay.TotalMilliseconds);
+                    _logger.LogInformation("Retrying in {retryMailDelay}ms to send a message.", retryDelay.TotalMilliseconds);
 
                     await Task.Delay(retryDelay, cancellationToken).ConfigureAwait(false);
                 } while (true);
@@ -938,6 +814,7 @@ namespace ReconArt.Email
             // We've failed here.
             return await OnEmailSendingFailureAsync(queuedMail.Message, mailOptions, failureReason).ConfigureAwait(false);
         }
+
 
         private async ValueTask<bool> OnEmailSendingFailureAsync(
             IEmailMessage mailMessage,
@@ -961,10 +838,9 @@ namespace ReconArt.Email
             return false;
         }
 
-        private async ValueTask<SmtpSendResult> TrySendingSmtpClientMailMessageAsync(
-            IEmailSmtpClient smtpClient,
+        private async ValueTask<(bool Successful, bool FailFast, EmailFailureReason)> TrySendingSmtpClientMailMessageAsync(
+            SmtpClient smtpClient,
             MimeMessage mail,
-            EmailSenderOptions options,
             CancellationToken cancellationToken)
         {
             Debug.Assert(smtpClient.IsConnected,
@@ -975,39 +851,17 @@ namespace ReconArt.Email
                 await smtpClient.SendAsync(mail, cancellationToken).ConfigureAwait(false);
                 _logger.LogInformation("Successfully sent message to {Recipients}.", string.Join(", ",
                     mail.To.Cast<MailboxAddress>().Select(static adr => adr.Address)));
-                return new(true, false, false, EmailFailureReason.None);
+                return (true, false, EmailFailureReason.None);
             }
             catch (ObjectDisposedException)
             {
                 _logger.LogError("Could not send message to SMTP server - object was disposed.");
-                return new(false, true, false, EmailFailureReason.Disposed);
+                return (false, true, EmailFailureReason.Disposed);
             }
             catch (OperationCanceledException) when (LogOperationCancelledWithoutUnwinding(_logger))
             {
                 // Honor typical async patterns, by keeping cancellation as an exception.
                 throw;
-            }
-            catch (SmtpCommandException ex) when (ex.Message == INVALID_ADDRESS)
-            {
-                _logger.LogError("Could not send message to SMTP server due to an invalid address - mail will be dropped.");
-                return new(false, true, false, EmailFailureReason.InvalidAddress);
-            }
-            catch (SmtpCommandException ex) when (ex.Message.StartsWith(SENDER_DENIED, StringComparison.Ordinal))
-            {
-                _logger.LogCritical("Could not send message to SMTP server as {FromAddress}. " +
-                    "Make sure your account has the necessary permissions and that you're using the correct address to send emails from.",
-                    ((MailboxAddress)mail.From[0]).Address);
-                return new(false, true, false, EmailFailureReason.SendAsDenied);
-            }
-            catch (SmtpCommandException ex) when (options.AuthenticationType == EmailSenderAuthenticationType.OAuth2 && ex.StatusCode == SmtpStatusCode.AuthenticationRequired)
-            {
-                _logger.LogWarning(ex, "SMTP server requested re-authentication. A token refresh will be attempted.");
-                return new(false, false, true, EmailFailureReason.AuthenticationFailed);
-            }
-            catch (ServiceNotAuthenticatedException ex) when (options.AuthenticationType == EmailSenderAuthenticationType.OAuth2)
-            {
-                _logger.LogWarning(ex, "SMTP client is no longer authenticated. A token refresh will be attempted.");
-                return new(false, false, true, EmailFailureReason.AuthenticationFailed);
             }
             catch (SmtpProtocolException ex)
             {
@@ -1020,186 +874,74 @@ namespace ReconArt.Email
                     _logger.LogError(ex, "Could not send message to SMTP server.");
                 }
 
-                return new(false, false, false, EmailFailureReason.Unknown);
+                return (false, false, EmailFailureReason.Unknown);
             }
             catch (IOException ex) when (ex.InnerException is not null)
             {
                 _logger.LogError(ex.InnerException, "Could not send message to SMTP server.");
-                return new(false, false, false, EmailFailureReason.Unknown);
+                return (false, false, EmailFailureReason.Unknown);
+            }
+            catch (SmtpCommandException ex) when (ex.Message == INVALID_ADDRESS)
+            {
+                _logger.LogError("Could not send message to SMTP server due to an invalid address - mail will be dropped.");
+                return (false, true, EmailFailureReason.InvalidAddress);
+            }
+            catch (SmtpCommandException ex) when (ex.Message.StartsWith(SENDER_DENIED))
+            {
+                _logger.LogCritical("Could not send message to SMTP server as {FromAddress}. " +
+                    "Make sure your account has the necessary permissions and that you're using the correct address to send emails from.",
+                    ((MailboxAddress)mail.From[0]).Address);
+                return (false, true, EmailFailureReason.SendAsDenied);
             }
             catch (ServiceNotAuthenticatedException)
             {
                 // This catch block should never be hit. It's just here as a defensive-coding practice in the event
                 // in the future we overlook the Debug.Assert statement.
                 _logger.LogCritical("Attempted to send message to SMTP server when no connection was established with it.");
-                return new(false, false, false, EmailFailureReason.NotConnected);
+                return (false, false, EmailFailureReason.NotConnected);
             }
             catch (ServiceNotConnectedException)
             {
                 // This catch block should never be hit. It's just here as a defensive-coding practice in the event
                 // in the future we overlook the Debug.Assert statement.
                 _logger.LogCritical("Attempted to send message to SMTP server when no connection was established with it.");
-                return new(false, false, false, EmailFailureReason.NotConnected);
+                return (false, false, EmailFailureReason.NotConnected);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Could not send message to SMTP server.");
-                return new(false, false, false, EmailFailureReason.Unknown);
+                return (false, false, EmailFailureReason.Unknown);
             }
         }
 
-        private async ValueTask EnsureValidOAuthAccessTokenAsync(EmailSenderOptions options, CancellationToken cancellationToken)
-        {
-            if (options.AuthenticationType != EmailSenderAuthenticationType.OAuth2)
-            {
-                return;
-            }
-
-            if (HasUsableOAuthAccessToken(options))
-            {
-                return;
-            }
-
-            bool refreshed = await TryRefreshOAuthTokenAsync(options, forceRefresh: false, cancellationToken).ConfigureAwait(false);
-            if (!refreshed || !HasUsableOAuthAccessToken(options))
-            {
-                throw new InvalidOperationException("OAuth2 access token is missing, expired, or could not be refreshed.");
-            }
-        }
-
-        private async ValueTask<bool> TryRefreshOAuthTokenAndReconnectAsync(
-            EmailSenderOptions options,
-            SmtpConnectionSlot? connectionSlot,
-            IEmailSmtpClient? temporaryClient,
-            CancellationToken cancellationToken,
-            string? previousAccessToken = null,
-            DateTime? previousAccessTokenExpiresAtUtc = null)
-        {
-            if (options.AuthenticationType != EmailSenderAuthenticationType.OAuth2)
-            {
-                return false;
-            }
-
-            EmailSenderOptions? latestOptions = await TryFetchCurrentOptionsForRetryAsync(cancellationToken).ConfigureAwait(false);
-            if (latestOptions is null)
-            {
-                return false;
-            }
-
-            if (latestOptions.AuthenticationType != EmailSenderAuthenticationType.OAuth2)
-            {
-                return true;
-            }
-
-            options = latestOptions;
-            if (previousAccessTokenExpiresAtUtc.HasValue
-                && HaveOAuthOptionValuesChanged(options, previousAccessToken, previousAccessTokenExpiresAtUtc.Value))
-            {
-                return true;
-            }
-
-            bool refreshed = await TryRefreshOAuthTokenAsync(
-                options,
-                forceRefresh: true,
-                cancellationToken,
-                connectionSlot,
-                previousAccessToken,
-                previousAccessTokenExpiresAtUtc).ConfigureAwait(false);
-            if (!refreshed)
-            {
-                return false;
-            }
-
-            if (temporaryClient is not null)
-            {
-                await DisconnectSmtpClientAsync(temporaryClient).ConfigureAwait(false);
-            }
-
-            return true;
-        }
-
-        private async ValueTask<bool> TryRefreshOAuthTokenAsync(
-            EmailSenderOptions options,
-            bool forceRefresh,
-            CancellationToken cancellationToken,
-            SmtpConnectionSlot? connectionSlot = null,
-            string? previousAccessToken = null,
-            DateTime? previousAccessTokenExpiresAtUtc = null)
-        {
-            options = _currentOptions ?? options;
-            if (options.AuthenticationType != EmailSenderAuthenticationType.OAuth2)
-            {
-                return false;
-            }
-
-            Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>>? refreshAccessTokenAsync = options.RefreshAccessTokenAsync;
-            if (refreshAccessTokenAsync is null)
-            {
-                return false;
-            }
-
-            bool lockTaken = false;
-
-            try
-            {
-                await _oauthRefreshLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-                lockTaken = true;
-
-                if (!forceRefresh && HasUsableOAuthAccessToken(options))
-                {
-                    return true;
-                }
-
-                if (forceRefresh)
-                {
-                    if (connectionSlot is not null && IsConnectionSlotReconnectRequired(connectionSlot))
-                    {
-                        return true;
-                    }
-
-                    if (connectionSlot is null
-                        && previousAccessTokenExpiresAtUtc.HasValue
-                        && HaveOAuthOptionValuesChanged(options, previousAccessToken, previousAccessTokenExpiresAtUtc.Value))
-                    {
-                        return true;
-                    }
-                }
-
-                EmailSenderOAuthRefreshResult refreshedToken = await refreshAccessTokenAsync(cancellationToken).ConfigureAwait(false);
-                ValidateRefreshedOAuthRefreshResult(refreshedToken);
-
-                await ApplyRefreshedOAuthCredentialsAsync(options, refreshedToken, cancellationToken).ConfigureAwait(false);
-
-                _logger.LogInformation("OAuth2 access token was refreshed.");
-                return true;
-            }
-            catch (OperationCanceledException) when (LogOperationCancelledWithoutUnwinding(_logger))
-            {
-                throw;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Could not refresh OAuth2 access token.");
-                return false;
-            }
-            finally
-            {
-                if (lockTaken)
-                {
-                    _oauthRefreshLock.Release();
-                }
-            }
-        }
-
-        private async ValueTask<EmailSenderOptions?> TryFetchCurrentOptionsForRetryAsync(CancellationToken cancellationToken)
+        private async ValueTask<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellation = default)
         {
             try
             {
-                return await FetchCurrentOptionsAsync(cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException) when (LogOperationCancelledWithoutUnwinding(_logger))
-            {
-                throw;
+                EmailSenderOptions? options;
+                IEmailSenderOptionsProvider? optionsProvider = _optionsProvider;
+                if (optionsProvider is null)
+                {
+                    Debug.Assert(_mailOptions is not null, "Either IEmailSenderOptionsProvider is null or MailOptions is, never both.");
+                    options = _mailOptions.CurrentValue;
+                }
+                else
+                {
+                    options = await optionsProvider.GetOptionsAsync(cancellation).ConfigureAwait(false);
+                }
+
+                if (options is not null)
+                {
+                    ObjectValidator.ValidateObjectOrThrow(options);
+
+                    // Pull-based refresh: one mechanism covers monitor reloads, fresh rows from
+                    // the provider, and in-place OAuth token mutations - those sources don't
+                    // share a change-notification channel, so pushing can't cover them all.
+                    _cachedAddressParserOptions = CreateParserOptions(options);
+                    RefreshConnectionInfo(options);
+                }
+
+                return options;
             }
             catch (Exception ex)
             {
@@ -1208,157 +950,37 @@ namespace ReconArt.Email
             }
         }
 
-        private async ValueTask ApplyRefreshedOAuthCredentialsAsync(
-            EmailSenderOptions options,
-            EmailSenderOAuthRefreshResult refreshedToken,
-            CancellationToken cancellationToken)
+        private void RefreshConnectionInfo(EmailSenderOptions options)
         {
-            await _configurationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
-            try
+            // Snapshot immediately. Never compare against or cache the live options instance -
+            // the OAuth refresh callback mutates it in place, which would make the comparison
+            // vacuously true whenever the cached and incoming references are the same object.
+            ConnectionCredentials incoming = ConnectionCredentials.From(options);
+
+            ConnectionCredentials? current = Volatile.Read(ref _currentCredentials);
+            while (true)
             {
-                EmailSenderOptions effectiveOptions = _currentOptions ?? options;
-                effectiveOptions.AccessToken = refreshedToken.AccessToken;
-                effectiveOptions.AccessTokenExpiresAtUtc = refreshedToken.AccessTokenExpiresAtUtc;
-                if (refreshedToken.RefreshToken is not null)
+                // Value-equality gate. This is not just an optimization: publishing a new
+                // *reference* is precisely what tells every connection to re-authenticate,
+                // so identical values must not produce a new reference. The CAS retry re-checks
+                // against the freshly witnessed value, so two racing refreshes with equal
+                // snapshots can never install two distinct-but-equal references.
+                // Two racing refreshes with *different* values may still publish in either
+                // order - inherent without the options source supplying a version; connections
+                // converge on the next fetch.
+                if (incoming == current)
                 {
-                    effectiveOptions.RefreshToken = refreshedToken.RefreshToken;
+                    return;
                 }
 
-                _currentOptions = effectiveOptions;
-                MarkOAuthConnectionSlotsForReconnect();
-            }
-            finally
-            {
-                _configurationLock.Release();
-            }
-
-            await OnOAuth2CredentialsRefreshedAsync(_currentOptions ?? options, refreshedToken, cancellationToken).ConfigureAwait(false);
-        }
-
-        private async ValueTask OnOAuth2CredentialsRefreshedAsync(
-            EmailSenderOptions options,
-            EmailSenderOAuthRefreshResult refreshedToken,
-            CancellationToken cancellationToken)
-        {
-            if (options.OnOAuth2CredentialsRefreshed is null)
-            {
-                return;
-            }
-
-            try
-            {
-                await options.OnOAuth2CredentialsRefreshed(refreshedToken, cancellationToken).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Caught exception in user-provided delegate.");
-            }
-        }
-
-        private async ValueTask DisconnectSmtpClientAsync(IEmailSmtpClient smtpClient)
-        {
-            try
-            {
-                if (smtpClient.IsConnected)
+                ConnectionCredentials? witnessed = Interlocked.CompareExchange(ref _currentCredentials, incoming, current);
+                if (ReferenceEquals(witnessed, current))
                 {
-                    // Do not pass the cancellation token. We want to disconnect gracefully.
-#pragma warning disable CA2016 // Forward the 'CancellationToken' parameter to methods
-                    await smtpClient.DisconnectAsync(true).ConfigureAwait(false);
-#pragma warning restore CA2016 // Forward the 'CancellationToken' parameter to methods
+                    return;
                 }
+
+                current = witnessed;
             }
-            catch (Exception ex)
-            {
-                _logger.LogDebug(ex, "Failed to disconnect SMTP client cleanly.");
-            }
-        }
-
-        private async ValueTask DisconnectConnectionSlotAsync(SmtpConnectionSlot connectionSlot)
-        {
-            await DisconnectSmtpClientAsync(connectionSlot.Client).ConfigureAwait(false);
-        }
-
-        private void MarkOAuthConnectionSlotsForReconnect()
-        {
-            MarkAllConnectionSlotsForReconnect();
-        }
-
-        private void MarkAllConnectionSlotsForReconnect()
-        {
-            for (int i = 0; i < _requiresReconnectBySlot.Length; i++)
-            {
-                _requiresReconnectBySlot[i] = true;
-            }
-        }
-
-        private bool IsConnectionSlotReconnectRequired(SmtpConnectionSlot connectionSlot) =>
-            connectionSlot.Index >= 0
-            && connectionSlot.Index < _requiresReconnectBySlot.Length
-            && _requiresReconnectBySlot[connectionSlot.Index];
-
-        private void ClearConnectionSlotReconnectRequired(SmtpConnectionSlot connectionSlot)
-        {
-            if (connectionSlot.Index >= 0 && connectionSlot.Index < _requiresReconnectBySlot.Length)
-            {
-                _requiresReconnectBySlot[connectionSlot.Index] = false;
-            }
-        }
-
-        private static bool HasUsableOAuthAccessToken(EmailSenderOptions options) =>
-            !string.IsNullOrWhiteSpace(options.AccessToken)
-            && options.AccessTokenExpiresAtUtc > DateTime.UtcNow.AddMinutes(1);
-
-        private static bool HaveOAuthOptionValuesChanged(
-            EmailSenderOptions options,
-            string? previousAccessToken,
-            DateTime previousAccessTokenExpiresAtUtc) =>
-            !string.Equals(options.AccessToken, previousAccessToken, StringComparison.Ordinal)
-            || options.AccessTokenExpiresAtUtc != previousAccessTokenExpiresAtUtc;
-
-        private static bool HaveSameSmtpRuntimeOptions(EmailSenderOptions first, EmailSenderOptions second) =>
-            string.Equals(first.Host, second.Host, StringComparison.Ordinal)
-            && first.Port == second.Port
-            && first.AuthenticationType == second.AuthenticationType
-            && first.RequiresAuthentication == second.RequiresAuthentication
-            && string.Equals(first.Username, second.Username, StringComparison.Ordinal)
-            && string.Equals(first.Password, second.Password, StringComparison.Ordinal)
-            && string.Equals(first.AccessToken, second.AccessToken, StringComparison.Ordinal)
-            && first.AccessTokenExpiresAtUtc == second.AccessTokenExpiresAtUtc
-            && Equals(first.ServerCertificateValidationCallback, second.ServerCertificateValidationCallback);
-
-        private static bool UsesAuthenticatedIdentity(EmailSenderOptions options) =>
-            options.AuthenticationType == EmailSenderAuthenticationType.OAuth2
-            || (options.AuthenticationType == EmailSenderAuthenticationType.Basic && options.RequiresAuthentication);
-
-        private static bool IsRefreshableAuthenticationException(Exception ex) =>
-            ex is MailKit.Security.AuthenticationException or SmtpCommandException;
-
-        private static bool IsAuthenticationFailure(Exception ex) =>
-            ex is MailKit.Security.AuthenticationException or SmtpCommandException;
-
-        private static void ValidateRefreshedOAuthRefreshResult(EmailSenderOAuthRefreshResult refreshedToken)
-        {
-            ArgumentNullException.ThrowIfNull(refreshedToken);
-
-            if (string.IsNullOrWhiteSpace(refreshedToken.AccessToken))
-            {
-                throw new InvalidOperationException("RefreshAccessTokenAsync returned an empty access token.");
-            }
-
-            if (refreshedToken.AccessTokenExpiresAtUtc == default)
-            {
-                throw new InvalidOperationException("RefreshAccessTokenAsync returned an invalid access token expiration time.");
-            }
-
-            if (refreshedToken.AccessTokenExpiresAtUtc <= DateTime.UtcNow)
-            {
-                throw new InvalidOperationException("RefreshAccessTokenAsync returned an already expired access token.");
-            }
-        }
-
-        private void UpdateParserOptions(EmailSenderOptions options, string? optionsName)
-        {
-            _cachedAddressParserOptions = CreateParserOptions(options);
         }
 
         private static ParserOptions CreateParserOptions(EmailSenderOptions options) => new()
@@ -1367,6 +989,7 @@ namespace ReconArt.Email
             AllowAddressesWithoutDomain = options.AllowAddressesWithoutDomain,
             AllowUnquotedCommasInAddresses = options.AllowUnquotedCommasInAddresses
         };
+
 
         private static bool LogOperationCancelledWithoutUnwinding(ILogger<EmailSenderService> logger)
         {
@@ -1380,22 +1003,40 @@ namespace ReconArt.Email
             return StaticOptionsMonitor.Create(options);
         }
 
+        private static IOptions<EmailSenderStartupOptions> TransformEmailSenderStartupOptions(EmailSenderStartupOptions options)
+        {
+            ObjectValidator.ValidateObjectOrThrow(options);
+            return Options.Create(options);
+        }
+
         [GeneratedRegex(@"(\+|\.|\-)[0-9]+\@")]
         private static partial Regex MailRoutingRegex();
 
-        private readonly record struct SmtpClientConnectionResult(
-            bool Successful,
-            bool ShouldRefreshOAuthToken,
-            EmailFailureReason FailureReason,
-            Exception? Exception,
-            EmailSenderOptions EffectiveOptions);
-
-        private readonly record struct SmtpSendResult(
-            bool Successful,
-            bool FailFast,
-            bool ShouldRefreshOAuthToken,
-            EmailFailureReason FailureReason);
-
         #endregion
+
+        /// <summary>
+        /// Immutable snapshot of every option that determines whether an established,
+        /// authenticated SMTP session is still valid.
+        /// </summary>
+        private sealed record ConnectionCredentials(
+            EmailSenderAuthenticationType AuthenticationType,
+            bool RequiresAuthentication,
+            string Host,
+            int Port,
+            string? Username,
+            string? Password,
+            string? AccessToken,
+            string? RefreshToken)
+        {
+            public static ConnectionCredentials From(EmailSenderOptions options) => new(
+                options.AuthenticationType,
+                options.RequiresAuthentication,
+                options.Host,
+                options.Port,
+                options.Username,
+                options.Password,
+                options.AccessToken,
+                options.RefreshToken);
+        }
     }
 }
