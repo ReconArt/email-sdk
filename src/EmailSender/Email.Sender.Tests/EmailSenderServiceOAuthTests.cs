@@ -1,15 +1,15 @@
-using MailKit;
-using MailKit.Security;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
-using MimeKit;
-using ReconArt.Email.Sender.Internal;
 using System.ComponentModel.DataAnnotations;
-using System.Net;
 using Xunit;
 
 namespace ReconArt.Email.Sender.Tests;
 
+/// <summary>
+/// Behavioral tests for <see cref="EmailSenderService"/> driven over a real loopback SMTP
+/// socket (<see cref="TestSmtpServer"/>) - the service is exercised through its public
+/// surface exactly as production traffic would.
+/// </summary>
 public sealed class EmailSenderServiceOAuthTests
 {
     [Fact]
@@ -20,7 +20,7 @@ public sealed class EmailSenderServiceOAuthTests
     }
 
     [Fact]
-    public void Validate_OAuth2Options_RequiresAllOAuthFields()
+    public void Validate_OAuth2Options_RequiresRefreshCallbackButNotInitialToken()
     {
         EmailSenderOptions options = new()
         {
@@ -34,106 +34,63 @@ public sealed class EmailSenderServiceOAuthTests
         bool isValid = Validator.TryValidateObject(options, new ValidationContext(options), results, validateAllProperties: true);
 
         Assert.False(isValid);
-        Assert.Contains(results, static x => x.MemberNames.Contains(nameof(EmailSenderOptions.AccessToken)));
-        Assert.Contains(results, static x => x.MemberNames.Contains(nameof(EmailSenderOptions.AccessTokenExpiresAtUtc)));
         Assert.Contains(results, static x => x.MemberNames.Contains(nameof(EmailSenderOptions.RefreshAccessTokenAsync)));
+        // An initial access token and its expiry are optional - the service obtains a token
+        // via the refresh callback before first use when they are absent.
+        Assert.DoesNotContain(results, static x => x.MemberNames.Contains(nameof(EmailSenderOptions.AccessToken)));
+        Assert.DoesNotContain(results, static x => x.MemberNames.Contains(nameof(EmailSenderOptions.AccessTokenExpiresAtUtc)));
     }
 
     [Fact]
     public async Task TestConnectionAsync_BasicWithoutAuthentication_DoesNotAuthenticate()
     {
-        EmailSenderOptions options = EmailSenderOptions.CreateBasic(
-            host: "smtp.example.com",
-            port: 25,
-            requiresAuthentication: false,
-            fromAddress: "from@example.com");
-        options.MaxConcurrentConnections = 1;
-
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient());
-        await using EmailSenderService service = CreateService(options, factory);
+        await using TestSmtpServer server = new();
+        await using EmailSenderService service = CreateService(CreateBasicOptions(server.Port, requiresAuthentication: false));
 
         Exception? exception = await service.TestConnectionAsync();
 
         Assert.Null(exception);
-        FakeSmtpClient client = Assert.Single(factory.CreatedClients.Skip(1));
-        Assert.Equal(1, client.ConnectCount);
-        Assert.Equal(0, client.BasicAuthenticationCount);
-        Assert.Equal(0, client.OAuthAuthenticationCount);
+        SmtpSession session = Assert.Single(server.SnapshotSessions());
+        Assert.DoesNotContain(session.Commands, static c => c.StartsWith("AUTH", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
-    public async Task TestConnectionAsync_OAuth2_UsesOAuthAuthenticationAndRefreshesExpiredToken()
+    public async Task TestConnectionAsync_OAuth2_RefreshesExpiredTokenBeforeAuthenticating()
     {
-        int refreshCalls = 0;
-        EmailSenderOptions options = EmailSenderOptions.CreateOAuth2(
-            host: "smtp.example.com",
-            port: 587,
-            username: "mailer@example.com",
-            accessToken: "expired-token",
-            accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(-5),
-            refreshAccessTokenAsync: _ =>
-            {
-                refreshCalls++;
-                return ValueTask.FromResult(new EmailSenderOAuthRefreshResult
-                {
-                    AccessToken = "fresh-token",
-                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(30)
-                });
-            });
-        options.MaxConcurrentConnections = 1;
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "replacement-token";
 
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient());
-        await using EmailSenderService service = CreateService(options, factory);
+        int refreshCalls = 0;
+        EmailSenderOptions options = CreateOAuth2Options(server.Port, "expired-token", DateTime.UtcNow.AddMinutes(-5), _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            return ValueTask.FromResult(RefreshResult("replacement-token"));
+        });
+        await using EmailSenderService service = CreateService(options);
 
         Exception? exception = await service.TestConnectionAsync();
 
         Assert.Null(exception);
         Assert.Equal(1, refreshCalls);
-        Assert.Equal("fresh-token", options.AccessToken);
-        FakeSmtpClient client = Assert.Single(factory.CreatedClients.Skip(1));
-        Assert.Equal(0, client.BasicAuthenticationCount);
-        Assert.Equal(1, client.OAuthAuthenticationCount);
-        Assert.Equal("fresh-token", Assert.Single(client.OAuthAccessTokens));
+        Assert.Equal("replacement-token", options.AccessToken);
+        Assert.All(server.SnapshotSessions(), static s => Assert.DoesNotContain("expired-token", s.OAuthTokens));
+        Assert.Contains(server.SnapshotSessions(), static s => s.OAuthTokens.Contains("replacement-token"));
     }
 
     [Fact]
     public async Task TestConnectionAsync_OAuth2_ConcurrentAuthenticationFailure_RefreshesOnce()
     {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "replacement-token";
+
         int refreshCalls = 0;
-        EmailSenderOptions options = EmailSenderOptions.CreateOAuth2(
-            host: "smtp.example.com",
-            port: 587,
-            username: "mailer@example.com",
-            accessToken: "initial-token",
-            accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(10),
-            refreshAccessTokenAsync: async _ =>
-            {
-                Interlocked.Increment(ref refreshCalls);
-                await Task.Delay(100);
-                return new EmailSenderOAuthRefreshResult
-                {
-                    AccessToken = "replacement-token",
-                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(30)
-                };
-            });
-        options.MaxConcurrentConnections = 1;
-
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient
+        EmailSenderOptions options = CreateOAuth2Options(server.Port, "initial-token", DateTime.UtcNow.AddMinutes(10), async _ =>
         {
-            AuthenticateOAuthAsyncHandler = (mechanism, _) =>
-            {
-                NetworkCredential? credentials = ((SaslMechanismOAuth2)mechanism)
-                    .Credentials.GetCredential(new Uri("smtp://localhost"), mechanism.MechanismName);
-
-                if (credentials?.Password == "initial-token")
-                {
-                    throw new MailKit.Security.AuthenticationException("Initial token rejected.");
-                }
-
-                return Task.CompletedTask;
-            }
+            Interlocked.Increment(ref refreshCalls);
+            await Task.Delay(100);
+            return RefreshResult("replacement-token");
         });
-        await using EmailSenderService service = CreateService(options, factory);
+        await using EmailSenderService service = CreateService(options);
 
         Exception?[] results = await Task.WhenAll(
             service.TestConnectionAsync().AsTask(),
@@ -142,131 +99,60 @@ public sealed class EmailSenderServiceOAuthTests
         Assert.All(results, Assert.Null);
         Assert.Equal(1, refreshCalls);
         Assert.Equal("replacement-token", options.AccessToken);
-        Assert.Equal(3, factory.CreatedClients.Count);
-        Assert.All(factory.CreatedClients.Skip(1), client => Assert.Equal(["initial-token", "replacement-token"], client.OAuthAccessTokens));
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithoutValidConfiguration_ReturnsException()
+    {
+        await using TestSmtpServer server = new();
+        TestOptionsMonitor<EmailSenderOptions> monitor = new(new EmailSenderOptions());
+        await using EmailSenderService service = CreateService(monitor);
+
+        Exception? exception = await service.TestConnectionAsync();
+
+        Assert.IsType<InvalidOperationException>(exception);
+        Assert.Empty(server.SnapshotSessions());
     }
 
     [Fact]
     public async Task TrySendAsync_OAuth2_ConcurrentExpiredToken_RefreshesOnce()
     {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "refreshed-token";
+
         int refreshCalls = 0;
-        EmailSenderOptions options = EmailSenderOptions.CreateOAuth2(
-            host: "smtp.example.com",
-            port: 587,
-            username: "mailer@example.com",
-            accessToken: "expired-token",
-            accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(-1),
-            refreshAccessTokenAsync: async _ =>
-            {
-                Interlocked.Increment(ref refreshCalls);
-                await Task.Delay(100);
-                return new EmailSenderOAuthRefreshResult
-                {
-                    AccessToken = "refreshed-token",
-                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(30)
-                };
-            });
-        options.MaxConcurrentConnections = 2;
+        EmailSenderOptions options = CreateOAuth2Options(server.Port, "expired-token", DateTime.UtcNow.AddMinutes(-1), async _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            await Task.Delay(100);
+            return RefreshResult("refreshed-token");
+        });
+        await using EmailSenderService service = CreateService(options, maxConcurrentConnections: 2);
 
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient());
-        await using EmailSenderService service = CreateService(options, factory);
-
-        Task<bool> firstSend = service.TrySendAsync(new EmailMessage("first@example.com", "Subject", "Body")).AsTask();
-        Task<bool> secondSend = service.TrySendAsync(new EmailMessage("second@example.com", "Subject", "Body")).AsTask();
-
-        bool[] results = await Task.WhenAll(firstSend, secondSend);
+        bool[] results = await Task.WhenAll(
+            service.TrySendAsync(new EmailMessage("first@example.com", "Subject", "Body")).AsTask(),
+            service.TrySendAsync(new EmailMessage("second@example.com", "Subject", "Body")).AsTask());
 
         Assert.All(results, Assert.True);
         Assert.Equal(1, refreshCalls);
         Assert.Equal("refreshed-token", options.AccessToken);
-        Assert.Equal(2, factory.CreatedClients.Count);
-        Assert.All(factory.CreatedClients, client => Assert.Equal(1, client.OAuthAuthenticationCount));
+        Assert.All(server.MailSessions(), static s => Assert.Equal(["refreshed-token"], s.OAuthTokens));
     }
 
     [Fact]
-    public async Task TrySendAsync_OAuth2_SendLosesAuthentication_RefreshesAndReconnects()
+    public async Task TrySendAsync_OAuth2_NoInitialAccessToken_ObtainsOneBeforeFirstUse()
     {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "obtained-token";
+
+        // The caller holds only a refresh callback - no initial access token, no expiry.
         int refreshCalls = 0;
-        EmailSenderOptions options = EmailSenderOptions.CreateOAuth2(
-            host: "smtp.example.com",
-            port: 587,
-            username: "mailer@example.com",
-            accessToken: "initial-token",
-            accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(10),
-            refreshAccessTokenAsync: _ =>
-            {
-                refreshCalls++;
-                return ValueTask.FromResult(new EmailSenderOAuthRefreshResult
-                {
-                    AccessToken = "replacement-token",
-                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(30)
-                });
-            });
-        options.MaxConcurrentConnections = 1;
-
-        FakeSmtpClient smtpClient = new();
-        int sendAttempts = 0;
-        smtpClient.SendAsyncHandler = (_, _) =>
+        EmailSenderOptions options = CreateOAuth2Options(server.Port, accessToken: null, default, _ =>
         {
-            if (Interlocked.Increment(ref sendAttempts) == 1)
-            {
-                smtpClient.SetAuthenticationState(false);
-                throw new ServiceNotAuthenticatedException("Authentication expired.");
-            }
-
-            return Task.CompletedTask;
-        };
-
-        FakeSmtpClientFactory factory = new(() => smtpClient);
-        await using EmailSenderService service = CreateService(options, factory);
-
-        bool sent = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
-
-        Assert.True(sent);
-        Assert.Equal(1, refreshCalls);
-        Assert.Equal("replacement-token", options.AccessToken);
-        Assert.Equal(2, smtpClient.ConnectCount);
-        Assert.Equal(1, smtpClient.DisconnectCount);
-        Assert.Equal(2, smtpClient.OAuthAuthenticationCount);
-        Assert.Equal(["initial-token", "replacement-token"], smtpClient.OAuthAccessTokens);
-    }
-
-    [Fact]
-    public async Task TrySendAsync_OAuth2_ClearsReconnectFlagAfterSuccessfulReconnect()
-    {
-        int refreshCalls = 0;
-        EmailSenderOptions options = EmailSenderOptions.CreateOAuth2(
-            host: "smtp.example.com",
-            port: 587,
-            username: "mailer@example.com",
-            accessToken: "initial-token",
-            accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(10),
-            refreshAccessTokenAsync: _ =>
-            {
-                refreshCalls++;
-                return ValueTask.FromResult(new EmailSenderOAuthRefreshResult
-                {
-                    AccessToken = "replacement-token",
-                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(30)
-                });
-            });
-        options.MaxConcurrentConnections = 1;
-
-        FakeSmtpClient smtpClient = new();
-        int sendAttempts = 0;
-        smtpClient.SendAsyncHandler = (_, _) =>
-        {
-            if (Interlocked.Increment(ref sendAttempts) == 1)
-            {
-                smtpClient.SetAuthenticationState(false);
-                throw new ServiceNotAuthenticatedException("Authentication expired.");
-            }
-
-            return Task.CompletedTask;
-        };
-
-        FakeSmtpClientFactory factory = new(() => smtpClient);
-        await using EmailSenderService service = CreateService(options, factory);
+            Interlocked.Increment(ref refreshCalls);
+            return ValueTask.FromResult(RefreshResult("obtained-token"));
+        });
+        await using EmailSenderService service = CreateService(options);
 
         bool firstSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
         bool secondSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
@@ -274,38 +160,83 @@ public sealed class EmailSenderServiceOAuthTests
         Assert.True(firstSend);
         Assert.True(secondSend);
         Assert.Equal(1, refreshCalls);
-        Assert.Equal(2, smtpClient.ConnectCount);
-        Assert.Equal(1, smtpClient.DisconnectCount);
-        Assert.Equal(2, smtpClient.OAuthAuthenticationCount);
+        SmtpSession session = Assert.Single(server.MailSessions());
+        Assert.Equal(["obtained-token"], session.OAuthTokens);
+    }
+
+    [Fact]
+    public async Task TrySendAsync_OAuth2_UnknownExpiry_UsesTokenUntilServerRejectsIt()
+    {
+        await using TestSmtpServer server = new();
+
+        // Unknown expiry must mean "use optimistically", not "treat as stale" - the
+        // refresh delegate must not be invoked while the server accepts the token.
+        int refreshCalls = 0;
+        EmailSenderOptions options = CreateOAuth2Options(server.Port, "unexpiring-token", default, _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            return ValueTask.FromResult(RefreshResult("refreshed-token"));
+        });
+        await using EmailSenderService service = CreateService(options);
+
+        Assert.True(await service.TrySendAsync(new EmailMessage("first@example.com", "Subject", "Body")));
+        Assert.Equal(0, refreshCalls);
+
+        // Once the server starts rejecting it, the reactive path takes over.
+        server.RequiredOAuthToken = "refreshed-token";
+        server.FailMailWith530(1);
+
+        Assert.True(await service.TrySendAsync(new EmailMessage("second@example.com", "Subject", "Body")));
+        Assert.Equal(1, refreshCalls);
+    }
+
+    [Fact]
+    public async Task TrySendAsync_OAuth2_SendLosesAuthentication_RefreshesAndReconnects()
+    {
+        await using TestSmtpServer server = new();
+        server.FailMailWith530(1);
+
+        int refreshCalls = 0;
+        EmailSenderOptions options = CreateOAuth2Options(server.Port, "session-token", DateTime.UtcNow.AddMinutes(10), _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            return ValueTask.FromResult(RefreshResult("refreshed-token"));
+        });
+        await using EmailSenderService service = CreateService(options);
+
+        bool firstSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
+        bool secondSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
+
+        Assert.True(firstSend);
+        Assert.True(secondSend);
+        Assert.Equal(1, refreshCalls);
+        Assert.Equal("refreshed-token", options.AccessToken);
+
+        List<SmtpSession> mailSessions = server.MailSessions();
+        Assert.Equal(2, mailSessions.Count);
+        Assert.Equal(["session-token"], mailSessions[0].OAuthTokens);
+        Assert.True(mailSessions[0].SentQuit, "the de-authenticated session should be torn down gracefully");
+        Assert.Equal(["refreshed-token"], mailSessions[1].OAuthTokens);
+        // The second message reuses the re-authenticated session - no third connection.
+        Assert.Equal(2, mailSessions[1].DataCount);
     }
 
     [Fact]
     public async Task TrySendAsync_OAuth2CredentialsRefreshedCallbackFailure_DoesNotFailSend()
     {
+        await using TestSmtpServer server = new();
+
         int callbackCalls = 0;
         EmailSenderOAuthRefreshResult? callbackResult = null;
-        EmailSenderOptions options = EmailSenderOptions.CreateOAuth2(
-            host: "smtp.example.com",
-            port: 587,
-            username: "mailer@example.com",
-            accessToken: "expired-token",
-            accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(-1),
-            refreshAccessTokenAsync: _ => ValueTask.FromResult(new EmailSenderOAuthRefreshResult
-            {
-                AccessToken = "replacement-token",
-                RefreshToken = "replacement-refresh-token",
-                AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(30)
-            }));
-        options.MaxConcurrentConnections = 1;
+        EmailSenderOptions options = CreateOAuth2Options(server.Port, "expired-token", DateTime.UtcNow.AddMinutes(-1),
+            _ => ValueTask.FromResult(RefreshResult("replacement-token", "replacement-refresh-token")));
         options.OnOAuth2CredentialsRefreshed = (result, _) =>
         {
             callbackCalls++;
             callbackResult = result;
             throw new InvalidOperationException("User delegate failed.");
         };
-
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient());
-        await using EmailSenderService service = CreateService(options, factory);
+        await using EmailSenderService service = CreateService(options);
 
         bool sent = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
 
@@ -321,62 +252,36 @@ public sealed class EmailSenderServiceOAuthTests
     [Fact]
     public async Task TrySendAsync_ReleasesConnectionSlotAfterFailure()
     {
-        EmailSenderOptions options = EmailSenderOptions.CreateBasic(
-            host: "smtp.example.com",
-            port: 25,
-            requiresAuthentication: false,
-            fromAddress: "from@example.com");
-        options.MaxConcurrentConnections = 1;
+        await using TestSmtpServer server = new();
+        server.FailDataWith554(1);
+
+        EmailSenderOptions options = CreateBasicOptions(server.Port, requiresAuthentication: false);
         options.RetryCount = 0;
-
-        FakeSmtpClient smtpClient = new();
-        int attempts = 0;
-        smtpClient.SendAsyncHandler = (_, _) =>
-        {
-            if (Interlocked.Increment(ref attempts) == 1)
-            {
-                throw new InvalidOperationException("Simulated send failure.");
-            }
-
-            return Task.CompletedTask;
-        };
-
-        FakeSmtpClientFactory factory = new(() => smtpClient);
-        await using EmailSenderService service = CreateService(options, factory);
+        await using EmailSenderService service = CreateService(options);
 
         bool firstSend = await service.TrySendAsync(new EmailMessage("first@example.com", "Subject", "Body"));
         bool secondSend = await service.TrySendAsync(new EmailMessage("second@example.com", "Subject", "Body"));
 
         Assert.False(firstSend);
         Assert.True(secondSend);
-        Assert.Equal(2, smtpClient.SendCount);
+        Assert.Equal(1, service.GetFailedMessagesCount());
     }
 
     [Fact]
     public async Task TrySendAsync_BasicAuthenticationFailure_ReportsAuthenticationFailed()
     {
+        await using TestSmtpServer server = new();
+        server.RequiredBasicPassword = "the-real-password";
+
         EmailFailureReason? failureReason = null;
-        EmailSenderOptions options = EmailSenderOptions.CreateBasic(
-            host: "smtp.example.com",
-            port: 587,
-            requiresAuthentication: true,
-            username: "mailer@example.com",
-            password: "password");
-        options.MaxConcurrentConnections = 1;
+        EmailSenderOptions options = CreateBasicOptions(server.Port, requiresAuthentication: true, password: "wrong-password");
         options.RetryCount = 0;
         options.OnEmailSendingFailure = (_, reason) =>
         {
             failureReason = reason;
             return ValueTask.CompletedTask;
         };
-
-        FakeSmtpClient smtpClient = new()
-        {
-            AuthenticateBasicAsyncHandler = (_, _, _) => throw new MailKit.Security.AuthenticationException("Basic auth rejected.")
-        };
-
-        FakeSmtpClientFactory factory = new(() => smtpClient);
-        await using EmailSenderService service = CreateService(options, factory);
+        await using EmailSenderService service = CreateService(options);
 
         bool sent = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
 
@@ -387,44 +292,23 @@ public sealed class EmailSenderServiceOAuthTests
     [Fact]
     public async Task TrySendAsync_OAuth2AuthenticationFailureAfterRefresh_ReportsAuthenticationFailed()
     {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "token-nobody-has";
+
         int refreshCalls = 0;
         EmailFailureReason? failureReason = null;
-        EmailSenderOptions options = EmailSenderOptions.CreateOAuth2(
-            host: "smtp.example.com",
-            port: 587,
-            username: "mailer@example.com",
-            accessToken: "initial-token",
-            accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(10),
-            refreshAccessTokenAsync: _ =>
-            {
-                refreshCalls++;
-                return ValueTask.FromResult(new EmailSenderOAuthRefreshResult
-                {
-                    AccessToken = "replacement-token",
-                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(30)
-                });
-            });
-        options.MaxConcurrentConnections = 1;
+        EmailSenderOptions options = CreateOAuth2Options(server.Port, "initial-token", DateTime.UtcNow.AddMinutes(10), _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            return ValueTask.FromResult(RefreshResult("replacement-token"));
+        });
         options.RetryCount = 0;
         options.OnEmailSendingFailure = (_, reason) =>
         {
             failureReason = reason;
             return ValueTask.CompletedTask;
         };
-
-        FakeSmtpClient smtpClient = new()
-        {
-            AuthenticateOAuthAsyncHandler = (mechanism, _) =>
-            {
-                NetworkCredential? credentials = ((SaslMechanismOAuth2)mechanism)
-                    .Credentials.GetCredential(new Uri("smtp://localhost"), mechanism.MechanismName);
-
-                throw new MailKit.Security.AuthenticationException($"OAuth token rejected: {credentials?.Password}");
-            }
-        };
-
-        FakeSmtpClientFactory factory = new(() => smtpClient);
-        await using EmailSenderService service = CreateService(options, factory);
+        await using EmailSenderService service = CreateService(options);
 
         bool sent = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
 
@@ -434,418 +318,404 @@ public sealed class EmailSenderServiceOAuthTests
     }
 
     [Fact]
-    public async Task TrySendAsync_RuntimeMonitor_ActivatesBasicConfigurationWhenItBecomesAvailable()
+    public async Task TrySendAsync_OAuth2_DeadRefreshToken_FailsFastAndCoolsDown()
     {
-        TestOptionsMonitor<EmailSenderOptions> monitor = new(CreateUnavailableOptions());
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "token-nobody-has";
 
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient());
-        await using EmailSenderService service = CreateService(monitor, factory);
+        int refreshCalls = 0;
+        EmailSenderOptions options = CreateOAuth2Options(server.Port, "expired-token", DateTime.UtcNow.AddMinutes(-5), _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            throw new InvalidOperationException("Refresh token revoked.");
+        });
+        options.RetryCount = 0;
+        await using EmailSenderService service = CreateService(options);
+
+        bool firstSend = await service.TrySendAsync(new EmailMessage("first@example.com", "Subject", "Body"));
+        bool secondSend = await service.TrySendAsync(new EmailMessage("second@example.com", "Subject", "Body"));
+
+        Assert.False(firstSend);
+        Assert.False(secondSend);
+        Assert.Equal(1, refreshCalls);
+        Assert.Equal(2, service.GetFailedMessagesCount());
+    }
+
+    [Fact]
+    public async Task TrySendAsync_RuntimeMonitor_ActivatesConfigurationWhenItBecomesAvailable()
+    {
+        await using TestSmtpServer server = new();
+        TestOptionsMonitor<EmailSenderOptions> monitor = new(new EmailSenderOptions());
+        await using EmailSenderService service = CreateService(monitor);
 
         bool firstSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
 
-        monitor.Set(CreateBasicOptions(requiresAuthentication: true));
+        monitor.Set(CreateBasicOptions(server.Port, requiresAuthentication: true));
 
         bool secondSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
 
         Assert.False(firstSend);
         Assert.True(secondSend);
-        FakeSmtpClient client = Assert.Single(factory.CreatedClients);
-        Assert.Equal(1, client.ConnectCount);
-        Assert.Equal(1, client.BasicAuthenticationCount);
-    }
-
-    [Fact]
-    public async Task TrySendAsync_RuntimeMonitor_BasicToOAuth2_ReconnectsSlotClient()
-    {
-        TestOptionsMonitor<EmailSenderOptions> monitor = new(CreateBasicOptions(requiresAuthentication: true));
-
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient());
-        await using EmailSenderService service = CreateService(monitor, factory);
-
-        bool firstSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
-
-        monitor.Set(CreateOAuth2Options(
-                accessToken: "oauth-token",
-                accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(30),
-                refreshAccessTokenAsync: _ => ValueTask.FromResult(new EmailSenderOAuthRefreshResult
-                {
-                    AccessToken = "oauth-refresh-token",
-                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(60)
-                })));
-
-        bool secondSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
-
-        Assert.True(firstSend);
-        Assert.True(secondSend);
-        FakeSmtpClient client = Assert.Single(factory.CreatedClients);
-        Assert.Equal(1, client.BasicAuthenticationCount);
-        Assert.Equal(1, client.OAuthAuthenticationCount);
-        Assert.Equal(["oauth-token"], client.OAuthAccessTokens);
-        Assert.Equal(1, client.DisconnectCount);
-    }
-
-    [Fact]
-    public async Task TrySendAsync_RuntimeMonitor_OAuth2ToBasic_ReconnectsSlotClient()
-    {
-        TestOptionsMonitor<EmailSenderOptions> monitor = new(CreateOAuth2Options(
-                accessToken: "oauth-token",
-                accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(30),
-                refreshAccessTokenAsync: _ => ValueTask.FromResult(new EmailSenderOAuthRefreshResult
-                {
-                    AccessToken = "oauth-refresh-token",
-                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(60)
-                })));
-
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient());
-        await using EmailSenderService service = CreateService(monitor, factory);
-
-        bool firstSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
-
-        monitor.Set(CreateBasicOptions(requiresAuthentication: true));
-
-        bool secondSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
-
-        Assert.True(firstSend);
-        Assert.True(secondSend);
-        FakeSmtpClient client = Assert.Single(factory.CreatedClients);
-        Assert.Equal(1, client.OAuthAuthenticationCount);
-        Assert.Equal(1, client.BasicAuthenticationCount);
-        Assert.Equal(1, client.DisconnectCount);
-    }
-
-    [Fact]
-    public async Task TrySendAsync_RuntimeMonitor_InFlightSendUsesCurrentOptionsAfterReconnect()
-    {
-        TestOptionsMonitor<EmailSenderOptions> monitor = new(CreateBasicOptions(requiresAuthentication: true));
-
-        TaskCompletionSource noOpStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        TaskCompletionSource releaseNoOp = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        int clientCount = 0;
-
-        FakeSmtpClientFactory factory = new(() =>
-        {
-            clientCount++;
-            if (clientCount == 1)
-            {
-                return new FakeSmtpClient
-                {
-                    NoOpAsyncHandler = async cancellationToken =>
-                    {
-                        noOpStarted.TrySetResult();
-                        await releaseNoOp.Task.WaitAsync(cancellationToken);
-                    }
-                };
-            }
-
-            return new FakeSmtpClient();
-        });
-
-        await using EmailSenderService service = CreateService(monitor, factory);
-
-        bool firstSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
-        Task<bool> secondSendTask = service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body")).AsTask();
-
-        await noOpStarted.Task;
-
-        monitor.Set(CreateOAuth2Options(
-                accessToken: "oauth-token",
-                accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(30),
-                refreshAccessTokenAsync: _ => ValueTask.FromResult(new EmailSenderOAuthRefreshResult
-                {
-                    AccessToken = "oauth-refresh-token",
-                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(60)
-                })));
-
-        Exception? testConnectionException = await service.TestConnectionAsync();
-        releaseNoOp.SetResult();
-        bool secondSend = await secondSendTask;
-        bool thirdSend = await service.TrySendAsync(new EmailMessage("third@example.com", "Subject", "Body"));
-
-        Assert.True(firstSend);
-        Assert.Null(testConnectionException);
-        Assert.True(secondSend);
-        Assert.True(thirdSend);
-        Assert.Equal(2, factory.CreatedClients.Count);
-        Assert.Equal(1, factory.CreatedClients[0].BasicAuthenticationCount);
-        Assert.Equal(1, factory.CreatedClients[0].OAuthAuthenticationCount);
-        Assert.Equal(1, factory.CreatedClients[1].OAuthAuthenticationCount);
-        Assert.Equal(["oauth-token"], factory.CreatedClients[0].OAuthAccessTokens);
-        Assert.Equal(["oauth-token"], factory.CreatedClients[1].OAuthAccessTokens);
+        SmtpSession session = Assert.Single(server.MailSessions());
+        Assert.Equal("password", session.BasicPassword);
     }
 
     [Fact]
     public async Task TrySendAsync_RuntimeMonitor_RemovingConfiguration_MakesSenderUnavailable()
     {
-        TestOptionsMonitor<EmailSenderOptions> monitor = new(CreateBasicOptions(requiresAuthentication: false));
-
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient());
-        await using EmailSenderService service = CreateService(monitor, factory);
+        await using TestSmtpServer server = new();
+        TestOptionsMonitor<EmailSenderOptions> monitor = new(CreateBasicOptions(server.Port, requiresAuthentication: false));
+        await using EmailSenderService service = CreateService(monitor);
 
         bool firstSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
-        FakeSmtpClient client = Assert.Single(factory.CreatedClients);
 
-        monitor.Set(CreateUnavailableOptions());
+        monitor.Set(new EmailSenderOptions());
 
         bool secondSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
 
         Assert.True(firstSend);
         Assert.False(secondSend);
-        Assert.Equal(0, client.DisconnectCount);
+        Assert.Single(server.MailSessions());
     }
 
     [Fact]
-    public async Task TestConnectionAsync_RuntimeMonitor_WithoutValidConfiguration_ReturnsValidationException()
+    public async Task TrySendAsync_RuntimeMonitor_BasicToOAuth2_ReconnectsConnection()
     {
-        TestOptionsMonitor<EmailSenderOptions> monitor = new(CreateUnavailableOptions());
-
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient());
-        await using EmailSenderService service = CreateService(monitor, factory);
-
-        Exception? exception = await service.TestConnectionAsync();
-
-        Assert.IsType<ValidationException>(exception);
-        Assert.Single(factory.CreatedClients);
-    }
-
-    [Fact]
-    public async Task TrySendAsync_RuntimeMonitor_OAuthRefreshMutatesCurrentOptionsInstance()
-    {
-        int refreshCalls = 0;
-        EmailSenderOptions options = CreateOAuth2Options(
-            accessToken: "initial-token",
-            accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(10),
-            refreshAccessTokenAsync: _ =>
-            {
-                refreshCalls++;
-                return ValueTask.FromResult(new EmailSenderOAuthRefreshResult
-                {
-                    AccessToken = "replacement-token",
-                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(30)
-                });
-            });
-        TestOptionsMonitor<EmailSenderOptions> monitor = new(options);
-
-        FakeSmtpClient smtpClient = new()
-        {
-            AuthenticateOAuthAsyncHandler = (mechanism, _) =>
-            {
-                NetworkCredential? credentials = ((SaslMechanismOAuth2)mechanism)
-                    .Credentials.GetCredential(new Uri("smtp://localhost"), mechanism.MechanismName);
-
-                if (credentials?.Password == "initial-token")
-                {
-                    throw new MailKit.Security.AuthenticationException("Initial token rejected.");
-                }
-
-                return Task.CompletedTask;
-            }
-        };
-
-        FakeSmtpClientFactory factory = new(() => smtpClient);
-        await using EmailSenderService service = CreateService(monitor, factory);
+        await using TestSmtpServer server = new();
+        TestOptionsMonitor<EmailSenderOptions> monitor = new(CreateBasicOptions(server.Port, requiresAuthentication: true));
+        await using EmailSenderService service = CreateService(monitor);
 
         bool firstSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
-        smtpClient.SetAuthenticationState(false);
+
+        monitor.Set(CreateOAuth2Options(server.Port, "oauth-token", DateTime.UtcNow.AddMinutes(30),
+            static _ => ValueTask.FromResult(RefreshResult("unused-token"))));
+
         bool secondSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
 
         Assert.True(firstSend);
         Assert.True(secondSend);
-        Assert.Equal(1, refreshCalls);
-        Assert.Equal("replacement-token", options.AccessToken);
-        Assert.Equal(["initial-token", "replacement-token", "replacement-token"], smtpClient.OAuthAccessTokens);
-        Assert.Single(factory.CreatedClients);
+        List<SmtpSession> mailSessions = server.MailSessions();
+        Assert.Equal(2, mailSessions.Count);
+        Assert.Equal("password", mailSessions[0].BasicPassword);
+        Assert.True(mailSessions[0].SentQuit);
+        Assert.Equal(["oauth-token"], mailSessions[1].OAuthTokens);
     }
 
     [Fact]
-    public async Task TrySendAsync_RuntimeProvider_ChangedOptionsAfterAuthenticationFailure_RetriesWithFetchedToken()
+    public async Task TrySendAsync_RuntimeMonitor_OAuth2ToBasic_ReconnectsConnection()
     {
-        int refreshCalls = 0;
-        TestEmailSenderOptionsProvider provider = new(CreateOAuth2Options(
-            accessToken: "initial-token",
-            accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(10),
-            refreshAccessTokenAsync: _ =>
-            {
-                refreshCalls++;
-                return ValueTask.FromResult(new EmailSenderOAuthRefreshResult
-                {
-                    AccessToken = "callback-token",
-                    AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(30)
-                });
-            }));
+        await using TestSmtpServer server = new();
+        TestOptionsMonitor<EmailSenderOptions> monitor = new(CreateOAuth2Options(server.Port, "oauth-token", DateTime.UtcNow.AddMinutes(30),
+            static _ => ValueTask.FromResult(RefreshResult("unused-token"))));
+        await using EmailSenderService service = CreateService(monitor);
 
-        int providerCalls = 0;
-        provider.OnGetOptions = () =>
-        {
-            if (Interlocked.Increment(ref providerCalls) == 3)
-            {
-                provider.Set(CreateOAuth2Options(
-                    accessToken: "provider-token",
-                    accessTokenExpiresAtUtc: DateTime.UtcNow.AddMinutes(30),
-                    refreshAccessTokenAsync: _ =>
-                    {
-                        refreshCalls++;
-                        return ValueTask.FromResult(new EmailSenderOAuthRefreshResult
-                        {
-                            AccessToken = "callback-token",
-                            AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(30)
-                        });
-                    }));
-            }
-        };
+        bool firstSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
 
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient
-        {
-            AuthenticateOAuthAsyncHandler = (mechanism, _) =>
-            {
-                NetworkCredential? credentials = ((SaslMechanismOAuth2)mechanism)
-                    .Credentials.GetCredential(new Uri("smtp://localhost"), mechanism.MechanismName);
+        monitor.Set(CreateBasicOptions(server.Port, requiresAuthentication: true));
 
-                if (credentials?.Password == "initial-token")
-                {
-                    throw new MailKit.Security.AuthenticationException("Initial token rejected.");
-                }
+        bool secondSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
 
-                return Task.CompletedTask;
-            }
-        });
-        await using EmailSenderService service = CreateService(provider, factory);
-
-        bool sent = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
-
-        Assert.True(sent);
-        Assert.Equal(0, refreshCalls);
-        FakeSmtpClient client = Assert.Single(factory.CreatedClients);
-        Assert.Equal(["initial-token", "provider-token"], client.OAuthAccessTokens);
-        Assert.Equal(1, client.DisconnectCount);
+        Assert.True(firstSend);
+        Assert.True(secondSend);
+        List<SmtpSession> mailSessions = server.MailSessions();
+        Assert.Equal(2, mailSessions.Count);
+        Assert.Equal(["oauth-token"], mailSessions[0].OAuthTokens);
+        Assert.True(mailSessions[0].SentQuit);
+        Assert.Equal("password", mailSessions[1].BasicPassword);
     }
 
     [Fact]
     public async Task TrySendAsync_RuntimeProvider_EqualOptions_DoesNotReconnect()
     {
-        TestEmailSenderOptionsProvider provider = new(CreateBasicOptions(requiresAuthentication: true));
-
-        FakeSmtpClientFactory factory = new(static () => new FakeSmtpClient());
-        await using EmailSenderService service = CreateService(provider, factory);
+        await using TestSmtpServer server = new();
+        // A fresh, value-identical options instance per fetch must not produce a new
+        // credential generation, and therefore no reconnect.
+        FreshInstanceProvider provider = new(() => CreateBasicOptions(server.Port, requiresAuthentication: true));
+        await using EmailSenderService service = CreateService(provider);
 
         bool firstSend = await service.TrySendAsync(new EmailMessage("first@example.com", "Subject", "Body"));
         bool secondSend = await service.TrySendAsync(new EmailMessage("second@example.com", "Subject", "Body"));
 
         Assert.True(firstSend);
         Assert.True(secondSend);
-        Assert.Single(factory.CreatedClients);
-        Assert.Equal(1, factory.CreatedClients[0].ConnectCount);
-        Assert.Equal(1, factory.CreatedClients[0].BasicAuthenticationCount);
+        SmtpSession session = Assert.Single(server.MailSessions());
+        Assert.Equal(2, session.DataCount);
+        Assert.Equal("password", session.BasicPassword);
     }
 
     [Fact]
-    public async Task TrySendAsync_RuntimeProvider_ChangedOptions_ReconnectsFlaggedSlotsAsTheyAreUsed()
+    public async Task TrySendAsync_RuntimeProvider_StaleTokenRows_RefreshesOnceViaOverlay()
     {
-        EmailSenderOptions initialOptions = EmailSenderOptions.CreateBasic(
-            host: "smtp.example.com",
-            port: 587,
-            requiresAuthentication: true,
-            username: "mailer@example.com",
-            password: "initial-password");
-        initialOptions.MaxConcurrentConnections = 2;
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "fresh-token";
 
-        EmailSenderOptions replacementOptions = EmailSenderOptions.CreateBasic(
-            host: "smtp.example.com",
-            port: 587,
-            requiresAuthentication: true,
-            username: "mailer@example.com",
-            password: "replacement-password");
-        replacementOptions.MaxConcurrentConnections = 2;
-
-        TestEmailSenderOptionsProvider provider = new(initialOptions);
-        TaskCompletionSource firstSendStarted = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        TaskCompletionSource releaseFirstSend = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        int clientIndex = 0;
-
-        FakeSmtpClientFactory factory = new(() =>
+        // The provider materializes a fresh instance with the same stale persisted token on
+        // every fetch - the service's token overlay must prevent a refresh per message.
+        int refreshCalls = 0;
+        FreshInstanceProvider provider = new(() => CreateOAuth2Options(server.Port, "stale-row-token", DateTime.UtcNow.AddMinutes(-5), _ =>
         {
-            int index = Interlocked.Increment(ref clientIndex);
-            return new FakeSmtpClient
-            {
-                SendAsyncHandler = async (_, cancellationToken) =>
-                {
-                    if (index == 1)
-                    {
-                        firstSendStarted.TrySetResult();
-                        await releaseFirstSend.Task.WaitAsync(cancellationToken);
-                    }
-                }
-            };
-        });
-        await using EmailSenderService service = CreateService(provider, factory);
+            Interlocked.Increment(ref refreshCalls);
+            return ValueTask.FromResult(RefreshResult("fresh-token"));
+        }));
+        await using EmailSenderService service = CreateService(provider);
 
-        Task<bool> firstSendTask = service.TrySendAsync(new EmailMessage("first@example.com", "Subject", "Body")).AsTask();
-        await firstSendStarted.Task;
+        Assert.True(await service.TrySendAsync(new EmailMessage("first@example.com", "Subject", "Body")));
+        Assert.True(await service.TrySendAsync(new EmailMessage("second@example.com", "Subject", "Body")));
+        Assert.True(await service.TrySendAsync(new EmailMessage("third@example.com", "Subject", "Body")));
 
-        provider.Set(replacementOptions);
+        Assert.Equal(1, refreshCalls);
+        SmtpSession session = Assert.Single(server.MailSessions());
+        Assert.Equal(["fresh-token"], session.OAuthTokens);
+        Assert.Equal(3, session.DataCount);
+    }
 
-        bool secondSend = await service.TrySendAsync(new EmailMessage("second@example.com", "Subject", "Body"));
-        releaseFirstSend.SetResult();
-        bool firstSend = await firstSendTask;
-        bool thirdSend = await service.TrySendAsync(new EmailMessage("third@example.com", "Subject", "Body"));
+    [Fact]
+    public async Task TrySendAsync_RuntimeProvider_SourceRotatedToken_UsesItWithoutRefreshing()
+    {
+        await using TestSmtpServer server = new();
+
+        int refreshCalls = 0;
+        Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>> refresh = _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            return ValueTask.FromResult(RefreshResult("callback-token"));
+        };
+        TestEmailSenderOptionsProvider provider = new(CreateOAuth2Options(server.Port, "provider-token-1", DateTime.UtcNow.AddMinutes(30), refresh));
+        await using EmailSenderService service = CreateService(provider);
+
+        bool firstSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
+
+        provider.Set(CreateOAuth2Options(server.Port, "provider-token-2", DateTime.UtcNow.AddMinutes(30), refresh));
+
+        bool secondSend = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
 
         Assert.True(firstSend);
         Assert.True(secondSend);
-        Assert.True(thirdSend);
-        Assert.Equal(2, factory.CreatedClients.Count);
-        Assert.Equal(2, factory.CreatedClients[0].BasicAuthenticationCount);
-        Assert.Equal(1, factory.CreatedClients[1].BasicAuthenticationCount);
-        Assert.Equal(1, factory.CreatedClients[0].DisconnectCount);
+        // The source rotated the token itself - it is authoritative; the refresh delegate
+        // must not be invoked, and the rotated token must be used on the wire.
+        Assert.Equal(0, refreshCalls);
+        List<SmtpSession> mailSessions = server.MailSessions();
+        Assert.Equal(2, mailSessions.Count);
+        Assert.Equal(["provider-token-1"], mailSessions[0].OAuthTokens);
+        Assert.Equal(["provider-token-2"], mailSessions[1].OAuthTokens);
     }
 
-    private static EmailSenderService CreateService(EmailSenderOptions options, FakeSmtpClientFactory factory) =>
-        new(new TestOptionsMonitor<EmailSenderOptions>(options), NullLogger<EmailSenderService>.Instance, factory.Create);
-
-    private static EmailSenderService CreateService(TestOptionsMonitor<EmailSenderOptions> monitor, FakeSmtpClientFactory factory) =>
-        new(monitor, NullLogger<EmailSenderService>.Instance, factory.Create);
-
-    private static EmailSenderService CreateService(TestEmailSenderOptionsProvider provider, FakeSmtpClientFactory factory) =>
-        new(provider, NullLogger<EmailSenderService>.Instance, factory.Create);
-
-    private static EmailSenderOptions CreateUnavailableOptions() => new()
+    [Fact]
+    public async Task TrySendAsync_RuntimeProvider_ChangedPassword_ReconnectsEachSlotAsUsed()
     {
-        MaxConcurrentConnections = 1
+        await using TestSmtpServer server = new();
+        TestEmailSenderOptionsProvider provider = new(CreateBasicOptions(server.Port, requiresAuthentication: true, password: "password-1"));
+        await using EmailSenderService service = CreateService(provider, maxConcurrentConnections: 2);
+
+        // Hold both connection slots in-flight at once so both authenticate with password-1.
+        SmtpDataStallGate firstGate = server.StallData(2);
+        Task<bool> send1 = service.TrySendAsync(new EmailMessage("first@example.com", "Subject", "Body")).AsTask();
+        Task<bool> send2 = service.TrySendAsync(new EmailMessage("second@example.com", "Subject", "Body")).AsTask();
+        await firstGate.AllEntered.Task;
+        firstGate.Release.SetResult();
+        Assert.All(await Task.WhenAll(send1, send2), Assert.True);
+
+        provider.Set(CreateBasicOptions(server.Port, requiresAuthentication: true, password: "password-2"));
+
+        // Same again - both slots are now stale and must each rebuild with password-2.
+        SmtpDataStallGate secondGate = server.StallData(2);
+        Task<bool> send3 = service.TrySendAsync(new EmailMessage("third@example.com", "Subject", "Body")).AsTask();
+        Task<bool> send4 = service.TrySendAsync(new EmailMessage("fourth@example.com", "Subject", "Body")).AsTask();
+        await secondGate.AllEntered.Task;
+        secondGate.Release.SetResult();
+        Assert.All(await Task.WhenAll(send3, send4), Assert.True);
+
+        List<SmtpSession> mailSessions = server.MailSessions();
+        Assert.Equal(4, mailSessions.Count);
+        Assert.Equal(2, mailSessions.Count(static s => s.BasicPassword == "password-1"));
+        Assert.Equal(2, mailSessions.Count(static s => s.BasicPassword == "password-2"));
+    }
+
+    [Fact]
+    public async Task TrySendAsync_OAuth2_RequiresAuthenticationFalse_StillUsesUsernameAsFrom()
+    {
+        await using TestSmtpServer server = new();
+
+        // OAuth2 with a username that is an email, no FromAddress, and RequiresAuthentication
+        // explicitly false - legal per the contract (RequiresAuthentication applies to Basic only).
+        // The message must send using the username as From, not be dropped as "malformed".
+        EmailSenderOptions options = CreateOAuth2Options(server.Port, "oauth-token", DateTime.UtcNow.AddMinutes(30),
+            static _ => ValueTask.FromResult(RefreshResult("unused-token")));
+        options.RequiresAuthentication = false;
+        await using EmailSenderService service = CreateService(options);
+
+        bool sent = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
+
+        Assert.True(sent);
+        SmtpSession session = Assert.Single(server.MailSessions());
+        Assert.Contains(session.Commands, static c => c.StartsWith("MAIL FROM:<mailer@example.com>", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task TrySendAsync_BasicAuthRejected_FailsFastWithoutExhaustingRetries()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredBasicPassword = "correct-password";
+
+        EmailSenderOptions options = CreateBasicOptions(server.Port, requiresAuthentication: true, password: "wrong-password");
+        options.RetryCount = 3;
+        options.RetryDelayInMilliseconds = 1;
+        await using EmailSenderService service = CreateService(options);
+
+        bool sent = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
+
+        Assert.False(sent);
+        // A pinned Basic credential snapshot cannot be corrected by retrying, so authentication
+        // must be attempted exactly once - not RetryCount + 1 times.
+        int authAttempts = server.SnapshotSessions()
+            .Sum(s => s.Commands.Count(static c => c.StartsWith("AUTHPW", StringComparison.Ordinal)));
+        Assert.Equal(1, authAttempts);
+    }
+
+    [Fact]
+    public async Task GetOptions_ConcurrentSends_CoalesceOntoASingleProviderFetch()
+    {
+        await using TestSmtpServer server = new();
+        ConcurrencyTrackingProvider provider = new(server.Port);
+        await using EmailSenderService service = CreateService(provider, maxConcurrentConnections: 8);
+
+        Task<bool>[] sends = Enumerable.Range(0, 8)
+            .Select(_ => service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body")).AsTask())
+            .ToArray();
+
+        Assert.All(await Task.WhenAll(sends), Assert.True);
+
+        // Single-flight: the options source is never queried concurrently, however many messages
+        // are in flight at once.
+        Assert.Equal(1, provider.MaxConcurrentCalls);
+        // And concurrent callers coalesce onto one fetch, so far fewer than the 16 fetches
+        // (8 schedule-time + 8 send-time) the un-coalesced path would have issued.
+        Assert.True(provider.Calls < 8, $"expected coalesced fetches, got {provider.Calls}");
+    }
+
+    [Fact]
+    public async Task TrySendAsync_PermanentRecipientRejection_NonExchangeWording_FailsFastAsInvalidAddress()
+    {
+        await using TestSmtpServer server = new();
+        // Postfix-style permanent rejection - deliberately NOT Exchange's "5.1.3 Invalid address".
+        // Classification must key off the 5xx status + RCPT context, not the message text.
+        server.RejectRecipient("550 5.1.1 <target@example.com>: Recipient address rejected: User unknown", count: 10);
+
+        EmailFailureReason? reason = null;
+        EmailSenderOptions options = CreateBasicOptions(server.Port, requiresAuthentication: false);
+        options.RetryCount = 3;
+        options.RetryDelayInMilliseconds = 1;
+        options.OnEmailSendingFailure = (_, r) =>
+        {
+            reason = r;
+            return ValueTask.CompletedTask;
+        };
+        await using EmailSenderService service = CreateService(options);
+
+        bool sent = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
+
+        Assert.False(sent);
+        Assert.Equal(EmailFailureReason.InvalidAddress, reason);
+        int rcptAttempts = server.SnapshotSessions()
+            .Sum(s => s.Commands.Count(static c => c.StartsWith("RCPT", StringComparison.OrdinalIgnoreCase)));
+        Assert.Equal(1, rcptAttempts); // fail-fast: a permanent 5xx recipient rejection is not retried
+    }
+
+    [Fact]
+    public async Task TrySendAsync_PermanentSenderRejection_NonExchangeWording_FailsFastAsSendAsDenied()
+    {
+        await using TestSmtpServer server = new();
+        // Generic 5xx sender rejection, no Exchange "5.2.252 SendAsDenied" text in sight.
+        server.RejectSender("550 5.7.1 Sender address rejected: not authorized", count: 10);
+
+        EmailFailureReason? reason = null;
+        EmailSenderOptions options = CreateBasicOptions(server.Port, requiresAuthentication: false);
+        options.RetryCount = 3;
+        options.RetryDelayInMilliseconds = 1;
+        options.OnEmailSendingFailure = (_, r) =>
+        {
+            reason = r;
+            return ValueTask.CompletedTask;
+        };
+        await using EmailSenderService service = CreateService(options);
+
+        bool sent = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
+
+        Assert.False(sent);
+        Assert.Equal(EmailFailureReason.SendAsDenied, reason);
+        int mailAttempts = server.SnapshotSessions()
+            .Sum(s => s.Commands.Count(static c => c.StartsWith("MAIL", StringComparison.OrdinalIgnoreCase)));
+        Assert.Equal(1, mailAttempts);
+    }
+
+    [Fact]
+    public async Task TrySendAsync_TransientRecipientRejection_RetriesAndSucceeds()
+    {
+        await using TestSmtpServer server = new();
+        // 4xx is transient - reject once, then accept. Must NOT fail-fast; the retry delivers.
+        server.RejectRecipient("450 4.2.1 Mailbox temporarily unavailable", count: 1);
+
+        EmailSenderOptions options = CreateBasicOptions(server.Port, requiresAuthentication: false);
+        options.RetryCount = 3;
+        options.RetryDelayInMilliseconds = 1;
+        await using EmailSenderService service = CreateService(options);
+
+        bool sent = await service.TrySendAsync(new EmailMessage("target@example.com", "Subject", "Body"));
+
+        Assert.True(sent);
+        int rcptAttempts = server.SnapshotSessions()
+            .Sum(s => s.Commands.Count(static c => c.StartsWith("RCPT", StringComparison.OrdinalIgnoreCase)));
+        Assert.Equal(2, rcptAttempts); // one transient rejection, one accepted retry
+    }
+
+    private static EmailSenderService CreateService(EmailSenderOptions options, int maxConcurrentConnections = 1) =>
+        CreateService(new TestOptionsMonitor<EmailSenderOptions>(options), maxConcurrentConnections);
+
+    private static EmailSenderService CreateService(TestOptionsMonitor<EmailSenderOptions> monitor, int maxConcurrentConnections = 1) =>
+        new(monitor, Startup(maxConcurrentConnections), NullLogger<EmailSenderService>.Instance);
+
+    private static EmailSenderService CreateService(IEmailSenderOptionsProvider provider, int maxConcurrentConnections = 1) =>
+        new(provider, Options.Create(Startup(maxConcurrentConnections)), NullLogger<EmailSenderService>.Instance);
+
+    private static EmailSenderStartupOptions Startup(int maxConcurrentConnections) => new()
+    {
+        MaxConcurrentConnections = maxConcurrentConnections
     };
 
-    private static EmailSenderOptions CreateBasicOptions(bool requiresAuthentication)
+    private static EmailSenderOAuthRefreshResult RefreshResult(string accessToken, string? refreshToken = null) => new()
     {
-        EmailSenderOptions options = EmailSenderOptions.CreateBasic(
-            host: "smtp.example.com",
-            port: requiresAuthentication ? 587 : 25,
+        AccessToken = accessToken,
+        RefreshToken = refreshToken,
+        AccessTokenExpiresAtUtc = DateTime.UtcNow.AddMinutes(30)
+    };
+
+    private static EmailSenderOptions CreateBasicOptions(int port, bool requiresAuthentication, string password = "password") =>
+        EmailSenderOptions.CreateBasic(
+            host: "127.0.0.1",
+            port: port,
             requiresAuthentication: requiresAuthentication,
             username: requiresAuthentication ? "mailer@example.com" : null,
-            password: requiresAuthentication ? "password" : null,
+            password: requiresAuthentication ? password : null,
             fromAddress: requiresAuthentication ? null : "from@example.com");
-        options.MaxConcurrentConnections = 1;
-        return options;
-    }
 
     private static EmailSenderOptions CreateOAuth2Options(
-        string accessToken,
+        int port,
+        string? accessToken,
         DateTime accessTokenExpiresAtUtc,
-        Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>> refreshAccessTokenAsync)
-    {
-        EmailSenderOptions options = EmailSenderOptions.CreateOAuth2(
-            host: "smtp.example.com",
-            port: 587,
+        Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>> refreshAccessTokenAsync) =>
+        EmailSenderOptions.CreateOAuth2(
+            host: "127.0.0.1",
+            port: port,
             username: "mailer@example.com",
+            refreshAccessTokenAsync: refreshAccessTokenAsync,
             accessToken: accessToken,
-            accessTokenExpiresAtUtc: accessTokenExpiresAtUtc,
-            refreshAccessTokenAsync: refreshAccessTokenAsync);
-        options.MaxConcurrentConnections = 1;
-        return options;
-    }
+            accessTokenExpiresAtUtc: accessTokenExpiresAtUtc);
 }
 
 internal sealed class TestOptionsMonitor<TOptions>(TOptions currentValue) : IOptionsMonitor<TOptions>
     where TOptions : class
 {
     private readonly object _lock = new();
-    private readonly List<Action<TOptions, string?>> _listeners = [];
     private TOptions _currentValue = currentValue;
 
     public TOptions CurrentValue
@@ -861,42 +731,14 @@ internal sealed class TestOptionsMonitor<TOptions>(TOptions currentValue) : IOpt
 
     public TOptions Get(string? name) => CurrentValue;
 
-    public IDisposable? OnChange(Action<TOptions, string?> listener)
-    {
-        lock (_lock)
-        {
-            _listeners.Add(listener);
-        }
-
-        return new ChangeListener(this, listener);
-    }
+    public IDisposable? OnChange(Action<TOptions, string?> listener) => null;
 
     public void Set(TOptions value)
     {
-        Action<TOptions, string?>[] listeners;
         lock (_lock)
         {
             _currentValue = value;
-            listeners = [.. _listeners];
         }
-
-        foreach (Action<TOptions, string?> listener in listeners)
-        {
-            listener(value, Options.DefaultName);
-        }
-    }
-
-    private void Remove(Action<TOptions, string?> listener)
-    {
-        lock (_lock)
-        {
-            _listeners.Remove(listener);
-        }
-    }
-
-    private sealed class ChangeListener(TestOptionsMonitor<TOptions> owner, Action<TOptions, string?> listener) : IDisposable
-    {
-        public void Dispose() => owner.Remove(listener);
     }
 }
 
@@ -905,25 +747,11 @@ internal sealed class TestEmailSenderOptionsProvider(EmailSenderOptions? options
     private readonly object _lock = new();
     private EmailSenderOptions? _options = options;
 
-    public Action? OnGetOptions { get; set; }
-
     public ValueTask<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellationToken)
     {
-        OnGetOptions?.Invoke();
-
         lock (_lock)
         {
             return ValueTask.FromResult(_options);
-        }
-    }
-
-    public EmailSenderOptions? GetOptions()
-    {
-        OnGetOptions?.Invoke();
-
-        lock (_lock)
-        {
-            return _options;
         }
     }
 
@@ -936,98 +764,44 @@ internal sealed class TestEmailSenderOptionsProvider(EmailSenderOptions? options
     }
 }
 
-internal sealed class FakeSmtpClientFactory(Func<FakeSmtpClient> createClient)
+/// <summary>
+/// Materializes a brand-new options instance on every fetch, the way a database-backed
+/// provider would - nothing the service mutates on a fetched instance survives to the next.
+/// </summary>
+internal sealed class FreshInstanceProvider(Func<EmailSenderOptions?> factory) : IEmailSenderOptionsProvider
 {
-    public List<FakeSmtpClient> CreatedClients { get; } = [];
-
-    public IEmailSmtpClient Create(EmailSenderOptions options)
-    {
-        FakeSmtpClient client = createClient();
-        CreatedClients.Add(client);
-        return client;
-    }
+    public ValueTask<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellationToken) => ValueTask.FromResult(factory());
 }
 
-internal sealed class FakeSmtpClient : IEmailSmtpClient
+/// <summary>
+/// Records how many times it is queried and the peak number of *concurrent* queries. Each call
+/// holds briefly, so absent single-flight coalescing, overlapping callers would push the peak above 1.
+/// </summary>
+internal sealed class ConcurrencyTrackingProvider(int port) : IEmailSenderOptionsProvider
 {
-    public int ConnectCount { get; private set; }
+    private int _inside;
 
-    public int DisconnectCount { get; private set; }
+    public int Calls;
+    public int MaxConcurrentCalls;
 
-    public int BasicAuthenticationCount { get; private set; }
-
-    public int OAuthAuthenticationCount { get; private set; }
-
-    public int NoOpCount { get; private set; }
-
-    public int SendCount { get; private set; }
-
-    public List<string> OAuthAccessTokens { get; } = [];
-
-    public bool IsConnected { get; private set; }
-
-    public bool IsAuthenticated { get; private set; }
-
-    public Func<string, int, SecureSocketOptions, CancellationToken, Task>? ConnectAsyncHandler { get; set; }
-
-    public Func<string, string, CancellationToken, Task>? AuthenticateBasicAsyncHandler { get; set; }
-
-    public Func<SaslMechanism, CancellationToken, Task>? AuthenticateOAuthAsyncHandler { get; set; }
-
-    public Func<CancellationToken, Task>? NoOpAsyncHandler { get; set; }
-
-    public Func<MimeMessage, CancellationToken, Task>? SendAsyncHandler { get; set; }
-
-    public Task ConnectAsync(string host, int port, SecureSocketOptions options, CancellationToken cancellationToken)
+    public async ValueTask<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellationToken)
     {
-        ConnectCount++;
-        IsConnected = true;
-        return ConnectAsyncHandler?.Invoke(host, port, options, cancellationToken) ?? Task.CompletedTask;
-    }
-
-    public Task AuthenticateAsync(string username, string password, CancellationToken cancellationToken)
-    {
-        BasicAuthenticationCount++;
-        IsAuthenticated = true;
-        return AuthenticateBasicAsyncHandler?.Invoke(username, password, cancellationToken) ?? Task.CompletedTask;
-    }
-
-    public Task AuthenticateAsync(SaslMechanism mechanism, CancellationToken cancellationToken)
-    {
-        OAuthAuthenticationCount++;
-        if (mechanism is SaslMechanismOAuth2 oauthMechanism)
+        Interlocked.Increment(ref Calls);
+        int concurrent = Interlocked.Increment(ref _inside);
+        for (int observed = Volatile.Read(ref MaxConcurrentCalls);
+             observed < concurrent && Interlocked.CompareExchange(ref MaxConcurrentCalls, concurrent, observed) != observed;
+             observed = Volatile.Read(ref MaxConcurrentCalls))
         {
-            NetworkCredential? credentials = oauthMechanism.Credentials.GetCredential(new Uri("smtp://localhost"), oauthMechanism.MechanismName);
-            OAuthAccessTokens.Add(credentials?.Password ?? string.Empty);
         }
 
-        IsAuthenticated = true;
-        return AuthenticateOAuthAsyncHandler?.Invoke(mechanism, cancellationToken) ?? Task.CompletedTask;
-    }
-
-    public Task NoOpAsync(CancellationToken cancellationToken)
-    {
-        NoOpCount++;
-        return NoOpAsyncHandler?.Invoke(cancellationToken) ?? Task.CompletedTask;
-    }
-
-    public Task SendAsync(MimeMessage message, CancellationToken cancellationToken)
-    {
-        SendCount++;
-        return SendAsyncHandler?.Invoke(message, cancellationToken) ?? Task.CompletedTask;
-    }
-
-    public Task DisconnectAsync(bool quit, CancellationToken cancellationToken = default)
-    {
-        DisconnectCount++;
-        IsConnected = false;
-        IsAuthenticated = false;
-        return Task.CompletedTask;
-    }
-
-    public void SetAuthenticationState(bool isAuthenticated) => IsAuthenticated = isAuthenticated;
-
-    public void Dispose()
-    {
+        try
+        {
+            await Task.Delay(50, cancellationToken);
+            return EmailSenderOptions.CreateBasic("127.0.0.1", port, requiresAuthentication: false, fromAddress: "from@example.com");
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _inside);
+        }
     }
 }

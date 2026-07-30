@@ -100,26 +100,18 @@ namespace ReconArt.Email
 
         private async Task<bool> TestSmtpConnectionFailureAsync(CancellationToken cancellationToken)
         {
+            // TestConnectionAsync throws OperationCanceledException on shutdown (it is not a
+            // failure), which propagates out of ExecuteAsync's loop the way BackgroundService expects.
             Exception? exception = await _emailService.TestConnectionAsync(cancellationToken).ConfigureAwait(false);
             if (exception is null)
             {
                 _connectionException = null;
                 return false;
             }
-            else
-            {
-                if (exception is OperationCanceledException)
-                {
-                    _logger.LogError(exception, "Liveness check: Operation was cancelled while connecting to the SMTP server.");
-                }
-                else
-                {
-                    _logger.LogError(exception, "Liveness check: Could not connect to the SMTP server.");
-                }
 
-                _connectionException = exception;
-                return true;
-            }
+            _logger.LogError(exception, "Liveness check: Could not connect to the SMTP server.");
+            _connectionException = exception;
+            return true;
         }
     }
 }

@@ -16,13 +16,5 @@ namespace ReconArt.Email
         /// The current email sender options, or <see langword="null"/> when the email sender should be treated as unavailable.
         /// </returns>
         ValueTask<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellationToken);
-
-        /// <summary>
-        /// Gets the current email sender options.
-        /// </summary>
-        /// <returns>
-        /// The current email sender options, or <see langword="null"/> when the email sender should be treated as unavailable.
-        /// </returns>
-        EmailSenderOptions? GetOptions();
     }
 }

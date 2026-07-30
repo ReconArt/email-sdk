@@ -12,7 +12,7 @@ namespace ReconArt.Email
     public sealed class SchedulingIdentityEmailSenderService : EmailSenderService, IEmailSender
     {
         /// <summary>
-        /// Initializes a new instance of the <see cref="IdentityEmailSenderService"/> class.
+        /// Initializes a new instance of the <see cref="SchedulingIdentityEmailSenderService"/> class.
         /// </summary>
         /// <param name="mailOptions">Email sender options.</param>
         /// <param name="startupOptions">Email sender startup options.</param>

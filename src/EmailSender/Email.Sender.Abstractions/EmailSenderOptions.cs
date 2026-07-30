@@ -72,6 +72,8 @@ namespace ReconArt.Email
         /// </summary>
         /// <remarks>
         /// This property is only used when <see cref="AuthenticationType"/> is <see cref="EmailSenderAuthenticationType.OAuth2"/>.
+        /// <br/>
+        /// Optional: when not supplied, an access token is obtained via <see cref="RefreshAccessTokenAsync"/> before first use.
         /// </remarks>
         public string? AccessToken { get; set; }
 
@@ -85,10 +87,16 @@ namespace ReconArt.Email
         public string? RefreshToken { get; set; }
 
         /// <summary>
-        /// UTC expiration timestamp of the OAuth2 access token.
+        /// UTC expiration timestamp of the OAuth2 access token, typically computed from the
+        /// token response's <c>expires_in</c> value.
         /// </summary>
         /// <remarks>
         /// This property is only used when <see cref="AuthenticationType"/> is <see cref="EmailSenderAuthenticationType.OAuth2"/>.
+        /// <br/>
+        /// Optional: when left at its default value the expiry is treated as unknown - the token
+        /// is used until the server rejects it, at which point it is refreshed. Supplying it
+        /// merely enables proactive refresh, avoiding one failed authentication round-trip per
+        /// token lifetime.
         /// </remarks>
         public DateTime AccessTokenExpiresAtUtc { get; set; }
 
@@ -97,8 +105,8 @@ namespace ReconArt.Email
         /// </summary>
         /// <remarks>
         /// This property is only used when <see cref="AuthenticationType"/> is <see cref="EmailSenderAuthenticationType.OAuth2"/>.
-        /// The returned token values will be applied to <see cref="AccessToken"/> and <see cref="AccessTokenExpiresAtUtc"/>
-        /// on the current <see cref="EmailSenderOptions"/> instance.
+        /// The returned token values will be applied to <see cref="AccessToken"/>, <see cref="AccessTokenExpiresAtUtc"/>, and -
+        /// when the provider rotates it - <see cref="RefreshToken"/> on the current <see cref="EmailSenderOptions"/> instance.
         /// </remarks>
         [JsonIgnore]
         public Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>>? RefreshAccessTokenAsync { get; set; }
@@ -286,9 +294,16 @@ namespace ReconArt.Email
         /// <param name="host">Host of the mail server.</param>
         /// <param name="port">Port of the mail server.</param>
         /// <param name="username">Username to authenticate as.</param>
-        /// <param name="accessToken">Initial OAuth2 access token.</param>
-        /// <param name="accessTokenExpiresAtUtc">Initial OAuth2 access token expiration timestamp, in UTC.</param>
         /// <param name="refreshAccessTokenAsync">Callback used to refresh the OAuth2 access token.</param>
+        /// <param name="accessToken">
+        /// Optional initial OAuth2 access token. When omitted, a token is obtained via
+        /// <paramref name="refreshAccessTokenAsync"/> before the first send.
+        /// </param>
+        /// <param name="accessTokenExpiresAtUtc">
+        /// Optional initial OAuth2 access token expiration timestamp, in UTC. When left at its default,
+        /// the expiry is treated as unknown - the token is used until the server rejects it. Supplying it
+        /// enables proactive refresh, avoiding one failed authentication round-trip per token lifetime.
+        /// </param>
         /// <param name="fromAddress">Email address to send emails from.</param>
         /// <param name="refreshToken">Initial OAuth2 refresh token, when applicable.</param>
         /// <param name="onOAuth2CredentialsRefreshed">Optional callback invoked after refreshed OAuth2 credentials are applied.</param>
@@ -298,9 +313,9 @@ namespace ReconArt.Email
             string host,
             int port,
             string username,
-            string accessToken,
-            DateTime accessTokenExpiresAtUtc,
             Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>> refreshAccessTokenAsync,
+            string? accessToken = null,
+            DateTime accessTokenExpiresAtUtc = default,
             string? fromAddress = null,
             string? refreshToken = null,
             Func<EmailSenderOAuthRefreshResult, CancellationToken, ValueTask>? onOAuth2CredentialsRefreshed = null)
@@ -361,16 +376,6 @@ namespace ReconArt.Email
                 if (string.IsNullOrWhiteSpace(Username))
                 {
                     yield return new("Username is required when OAuth2 authentication is enabled.", [nameof(Username)]);
-                }
-
-                if (string.IsNullOrWhiteSpace(AccessToken))
-                {
-                    yield return new("AccessToken is required when OAuth2 authentication is enabled.", [nameof(AccessToken)]);
-                }
-
-                if (AccessTokenExpiresAtUtc == default)
-                {
-                    yield return new("AccessTokenExpiresAtUtc is required when OAuth2 authentication is enabled.", [nameof(AccessTokenExpiresAtUtc)]);
                 }
 
                 if (RefreshAccessTokenAsync is null)

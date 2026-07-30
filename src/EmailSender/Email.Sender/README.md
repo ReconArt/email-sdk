@@ -6,7 +6,7 @@
 
 ## Features
 
-- **Targets .NET 8 and .NET 9**: Leverages the latest .NET frameworks for optimal performance and compatibility.
+- **Targets .NET 8, .NET 9, and .NET 10**: Leverages the latest .NET frameworks for optimal performance and compatibility.
 - **Thread-safe Design**: Utilizes a connection pool, ensuring thread safety and efficient resource management by prioritizing "hot" connections.
 - **Email Sending and Queuing**: Capable of sending emails immediately or queuing them for asynchronous dispatch.
 - **Health Monitoring**: Includes a separate service for monitoring the health and liveness of the email sender, ensuring reliability.
@@ -42,7 +42,7 @@ var emailSenderOptions = EmailSenderOptions.CreateBasic(
     fromAddress: "no-reply@example.com");
 
 // Create the email sender service
-var emailSenderService = new EmailSenderService(emailSenderOptions, configureLogger: builder =>
+var emailSenderService = new EmailSenderService(emailSenderOptions, new EmailSenderStartupOptions(), configureLogger: builder =>
 {
     builder.AddConsole();
 });
@@ -83,7 +83,7 @@ var emailSenderOptions = EmailSenderOptions.CreateOAuth2(
         await myTokenStore.SaveAsync(refreshedToken, cancellationToken);
     });
 
-var emailSenderService = new EmailSenderService(emailSenderOptions, configureLogger: builder =>
+var emailSenderService = new EmailSenderService(emailSenderOptions, new EmailSenderStartupOptions(), configureLogger: builder =>
 {
     builder.AddConsole();
 });
@@ -123,6 +123,8 @@ public class Startup
 In this setup, the `AddEmailSenderService` extension method is used to register the `EmailSenderService` with the ASP.NET Core dependency injection system. This method allows you to optionally load options from a configuration source, such as appsettings.json, and optionally override them with a delegate if needed.
 
 The method can be called without providing any arguments. In such case, an instance of `EmailSenderOptions` with the default values will be used.
+
+Startup options (`EmailSenderStartupOptions` - pool size, queue size, and the certificate-validation callback) bind from the `EmailSender:Startup` configuration section (or `<sectionName>:Startup` when a custom section name is supplied) and can be overridden with the optional `configureStartupOptions` delegate on `AddEmailSenderService`.
 
 For OAuth2 scenarios, prefer creating `EmailSenderOptions` in code via `CreateOAuth2(...)`, because access tokens and refresh callbacks are typically not a good fit for appsettings-driven configuration.
 
@@ -186,7 +188,7 @@ using ReconArt.Email;
 services.AddEmailSenderService<DatabaseEmailSenderOptionsMonitor>();
 ```
 
-The monitor should return a non-null `CurrentValue`. If credentials do not exist yet, return a placeholder `EmailSenderOptions` instance with valid `MaxConcurrentConnections` and `MessageQueueSize` values but incomplete transport settings. Sends will fail gracefully until the monitor publishes a valid `EmailSenderOptions.CreateBasic(...)` or `EmailSenderOptions.CreateOAuth2(...)` instance.
+The monitor should return a non-null `CurrentValue`. If credentials do not exist yet, return a placeholder `EmailSenderOptions` instance with incomplete transport settings. Sends will fail gracefully until the monitor publishes a valid `EmailSenderOptions.CreateBasic(...)` or `EmailSenderOptions.CreateOAuth2(...)` instance.
 
 `CurrentValue` should be fast and should not synchronously query the database on every send. Load from the database, Redis, or secret store into an in-memory value, replace the whole `EmailSenderOptions` instance when structural SMTP settings change, and notify registered `OnChange` listeners.
 
@@ -197,11 +199,8 @@ public sealed class DatabaseEmailSenderOptionsMonitor : IOptionsMonitor<EmailSen
 {
     private readonly object _lock = new();
     private readonly List<Action<EmailSenderOptions, string?>> _listeners = [];
-    private EmailSenderOptions _current = new()
-    {
-        MaxConcurrentConnections = 1,
-        MessageQueueSize = 100
-    };
+    // Placeholder until real credentials are available; sends fail gracefully until then.
+    private EmailSenderOptions _current = new();
 
     public EmailSenderOptions CurrentValue
     {
@@ -279,7 +278,7 @@ var emailSenderOptions = EmailSenderOptions.CreateBasic(
     fromAddress: "no-reply@example.com");
 
 // Create the email sender service
-var emailSenderService = new EmailSenderService(emailSenderOptions, configureLogger: builder =>
+var emailSenderService = new EmailSenderService(emailSenderOptions, new EmailSenderStartupOptions(), configureLogger: builder =>
 {
     builder.AddConsole();
 });
@@ -332,16 +331,13 @@ For more detailed insights into what each option does, refer to their XML docume
 | Username                       | string?                            | Username to authenticate as for the mail server. Required for basic-authenticated SMTP and OAuth2.                                                                                                                               | null          |
 | FromAddress                    | string?                            | Email address to send emails from. If `null`, `Username` will be used when it is a valid email address.                                                                                                                         | null          |
 | Password                       | string?                            | Password to authenticate as for the mail server. Used only for `AuthenticationType = Basic` when `RequiresAuthentication = true`.                                                                                                | null          |
-| AccessToken                    | string?                            | OAuth2 access token used for SMTP authentication. Required when `AuthenticationType = OAuth2`.                                                                                                                                   | null          |
+| AccessToken                    | string?                            | Optional initial OAuth2 access token. When omitted, one is obtained via `RefreshAccessTokenAsync` before the first send.                                                                                                         | null          |
 | RefreshToken                   | string?                            | OAuth2 refresh token used by upstream refresh callbacks, when applicable. Not used directly for SMTP authentication.                                                                                                             | null          |
-| AccessTokenExpiresAtUtc        | DateTime                           | UTC expiration time of the OAuth2 access token. Required when `AuthenticationType = OAuth2`.                                                                                                                                     | 0001-01-01    |
+| AccessTokenExpiresAtUtc        | DateTime                           | Optional UTC expiration of the OAuth2 access token. The default means the expiry is unknown - the token is used until the server rejects it; supplying it enables proactive refresh.                                             | 0001-01-01    |
 | RefreshAccessTokenAsync        | Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>>? | Callback that returns refreshed OAuth2 token values. Required when `AuthenticationType = OAuth2`.                                                                                                | null          |
 | OnOAuth2CredentialsRefreshed   | Func<EmailSenderOAuthRefreshResult, CancellationToken, ValueTask>? | Optional callback invoked after refreshed OAuth2 credentials are applied to the current options instance. Exceptions are logged and ignored.                                      | null          |
-| RetryCount                      | uint                              | Number of times to retry sending an email before giving up.                                                                                                                                                                      | 3             |
-| RetryDelayInMilliseconds        | uint                              | Approximate wait time before retrying to send an email. Uses a jitter formula for delay calculation.                                                                                                                             | 2000          |
-| MaxConcurrentConnections        | int                               | Maximum number of concurrent SMTP connections to maintain in the pool. Determines the maximum amount of simultaneous connections to the mail server that will be maintained for processing outgoing messages. Higher values can improve throughput under heavy load but may consume more resources and may be limited by the mail server. | 3             |
-| MessageQueueSize                | int                               | Number of messages that can be stored in the queue before applying back-pressure mechanisms. Set to -1 for storing an unlimited number of messages. When capacity is reached, calls to `TryScheduleAsync` will begin awaiting asynchronously until capacity is available. | 10,000        |
-| ServerCertificateValidationCallback | RemoteCertificateValidationCallback? | Callback to validate the server certificate. If no value is specified, the default validation will be used.                                                                                                               | null          |
+| RetryCount                      | int                               | Number of times to retry sending an email before giving up.                                                                                                                                                                      | 3             |
+| RetryDelayInMilliseconds        | int                               | Approximate wait time before retrying to send an email. Uses a jitter formula for delay calculation.                                                                                                                             | 2000          |
 | TreatEmptyRecipientsAsSuccess   | bool                              | Set to `true` to treat emails with no recipients as successfully sent.                                                                                                                                                           | false         |
 | EnableTempMailRouting           | bool                              | Allows using `some_email+N@somedomain.com` for routing to `some_email@somedomain.com`. Useful for testing.                                                                                                                       | false         |
 | Whitelist                       | string[]                          | Collection of email addresses allowed to receive emails. If empty, no filtering is applied.                                                                                                                                      | []            |
@@ -353,6 +349,16 @@ For more detailed insights into what each option does, refer to their XML docume
 | OnEmailSendingFailure           | Func<IEmailMessage, EmailFailureReason, ValueTask>? | Called when there's a failure sending an email to the SMTP server.                                                                                                                                             | null          |
 
 `OnEmailSendingFailure` will not be invoked if cancellation is requested. Additionally, unless `SignalFailureOnInvalidParameters` is set to `true`, it will not be called for failures during the construction of the MIME message. These failures can be inspected through the return values of `IEmailSenderService.TrySendAsync` and `IEmailSenderService.TryScheduleAsync`.
+
+#### EmailSenderStartupOptions Configuration Options
+
+These options are fixed at construction. In ASP.NET Core they bind from the `EmailSender:Startup` configuration section (or `<sectionName>:Startup` when a custom section name is used) and can be overridden with the `configureStartupOptions` delegate on `AddEmailSenderService`.
+
+| Option                              | Type                                 | Description                                                                                                                                                                                                                       | Default Value |
+|-------------------------------------|--------------------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|
+| MaxConcurrentConnections            | int                                  | Maximum number of concurrent SMTP connections maintained in the pool, and the maximum number of messages processed in parallel. Higher values improve throughput under load but consume more resources and may be limited by the mail server. | 3             |
+| MessageQueueSize                    | int                                  | Number of messages that can be queued before back-pressure applies. Set to -1 for unlimited. When capacity is reached, calls to `TryScheduleAsync` await asynchronously until capacity is available.                             | 10,000        |
+| ServerCertificateValidationCallback | RemoteCertificateValidationCallback? | Callback to validate the server certificate. If no value is specified, the default validation will be used.                                                                                                                      | null          |
 
 #### EmailSenderLivenessService Configuration Options
 

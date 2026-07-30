@@ -23,22 +23,26 @@ using System.Threading.Tasks.Dataflow;
 namespace ReconArt.Email
 {
     /// <summary>
-    /// Sends emails by using a single SMTP connection.
+    /// Sends emails using a pool of SMTP connections.
     /// </summary>
     /// <remarks>
-    /// Allows multi-threaded queuing of emails by utilizing an <see cref="ActionBlock{TInput}"/>
-    /// with a bounded capacity. In the event capacity is reached, the service will start failing to send emails and log a warning of the event, until capacity is regained.
+    /// The pool holds up to <see cref="EmailSenderStartupOptions.MaxConcurrentConnections"/> connections, each
+    /// owned exclusively by the thread processing a message. Queuing is multi-threaded via a bounded
+    /// <see cref="ActionBlock{TInput}"/>; when the queue is full, scheduling calls await asynchronously until
+    /// capacity is available.
     /// </remarks>
     public partial class EmailSenderService : IEmailSenderService, IAsyncDisposable
     {
-        private const string INVALID_ADDRESS = "5.1.3 Invalid address";
-        private const string SENDER_DENIED = "5.2.252 SendAsDenied";
+        // Access tokens within this window of expiry are refreshed proactively, so a token
+        // cannot expire between the fetch-time check and its use on the wire.
+        private static readonly TimeSpan OAuthTokenExpirySkew = TimeSpan.FromMinutes(1);
+
+        // After a failed refresh, further attempts are skipped for this long so a dead
+        // refresh token cannot hammer the token endpoint under queue load.
+        private static readonly TimeSpan OAuthRefreshFailureCooldown = TimeSpan.FromSeconds(30);
 
         private readonly SmtpClient[] _connections;
         private readonly int[] _connectionStatus; // 0=available, 1=in-use
-
-        // Slot i: the credential generation connection i last successfully authenticated with.
-        // Only ever accessed by the thread currently owning slot i via _connectionStatus.
         private readonly ConnectionCredentials?[] _connectionCredentials;
 
         private readonly ILogger<EmailSenderService> _logger;
@@ -46,10 +50,25 @@ namespace ReconArt.Email
         private readonly IEmailSenderOptionsProvider? _optionsProvider;
         private readonly ActionBlock<QueuedMail> _emailScheduleWork;
         private readonly EmailSenderStartupOptions _startupOptions;
-
-        // The currently-published credential generation. Swapped atomically, never mutated.
         private ConnectionCredentials? _currentCredentials;
-        private ParserOptions _cachedAddressParserOptions;
+
+        // The service's own OAuth2 token knowledge, layered over whatever the options source
+        // supplies. Swapped atomically, never mutated. Null while the source token is authoritative.
+        private OAuthTokenState? _oauthTokenState;
+
+
+        // Single-flight gates (null when idle): at most one of each runs at a time; concurrent
+        // callers coalesce onto the in-flight task instead of repeating the work. That keeps N
+        // OAuth failures from stampeding the token endpoint, and keeps options fetches from
+        // overlapping - so their credential publishes stay strictly ordered.
+        private Task<bool>? _oauthRefreshTask;
+        private Task<EmailSenderOptions?>? _optionsFetchTask;
+
+        // The last failed refresh attempt, keyed to the source token it was attempted for -
+        // rotated source credentials deserve a fresh attempt regardless of the cooldown.
+        // Swapped atomically; null after a successful refresh.
+        private OAuthRefreshFailure? _oauthRefreshFailure;
+
         private int _failedMessagesCount;
         private bool _disposed;
 
@@ -135,9 +154,8 @@ namespace ReconArt.Email
             }
 
             EmailSenderStartupOptions startupConfigurationOptions = startupOptions.Value;
-            // Validate on every path: the IOptions-based constructors would otherwise accept
-            // values (e.g. MaxConcurrentConnections = 0) that permanently fault the ActionBlock.
             ObjectValidator.ValidateObjectOrThrow(startupConfigurationOptions);
+
             _startupOptions = startupConfigurationOptions;
             _mailOptions = mailOptions;
             _optionsProvider = mailOptionsProvider;
@@ -165,19 +183,7 @@ namespace ReconArt.Email
 
             _connections = connections;
             _connectionStatus = new int[connections.Length];
-            // All-null slots read as "never authenticated" - first acquisition authenticates.
             _connectionCredentials = new ConnectionCredentials?[connections.Length];
-
-            try
-            {
-                _cachedAddressParserOptions = mailOptions is not null
-                    ? CreateParserOptions(mailOptions.CurrentValue)
-                    : CreateParserOptions(new());
-            }
-            catch
-            {
-                _cachedAddressParserOptions = CreateParserOptions(new());
-            }
         }
 
         #region Public_Methods
@@ -193,6 +199,7 @@ namespace ReconArt.Email
         /// <inheritdoc/>
         public async ValueTask<Exception?> TestConnectionAsync(CancellationToken cancellationToken = default)
         {
+            SmtpClient? client = null;
             try
             {
                 EmailSenderOptions? options = await GetOptionsAsync(cancellationToken).ConfigureAwait(false);
@@ -201,27 +208,65 @@ namespace ReconArt.Email
                     return new InvalidOperationException("Email sender is not configured.");
                 }
 
-                EmailSenderStartupOptions startupOptions = _startupOptions;
-                SmtpClient client = new();
-                if (startupOptions.ServerCertificateValidationCallback is not null)
+                // Probe with the same effective credentials the pool would use - the published
+                // snapshot has the current OAuth2 token overlaid, which `options` may not.
+                ConnectionCredentials credentials = Volatile.Read(ref _currentCredentials)!;
+                Debug.Assert(credentials is not null,
+                    "A successful options fetch always publishes a credentials snapshot.");
+
+                client = new SmtpClient();
+                if (_startupOptions.ServerCertificateValidationCallback is not null)
                 {
-                    client.ServerCertificateValidationCallback = startupOptions.ServerCertificateValidationCallback;
+                    client.ServerCertificateValidationCallback = _startupOptions.ServerCertificateValidationCallback;
                 }
 
-                try
+                bool refreshedAfterFailure = false;
+                while (true)
                 {
-                    await client.ConnectAsync(options.Host, options.Port, SecureSocketOptions.Auto, cancellationToken)
-                        .ConfigureAwait(false);
-
-                    if (options.RequiresAuthentication)
+                    Exception? attemptError;
+                    bool shouldRefreshToken;
+                    try
                     {
-                        await client.AuthenticateAsync(options.Username ?? string.Empty, options.Password ?? string.Empty, cancellationToken)
-                            .ConfigureAwait(false);
+                        await ConnectAndAuthenticateAsync(client, credentials, cancellationToken).ConfigureAwait(false);
+                        return null;
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        // Classify only. All recovery runs below, on a fully unwound stack - never
+                        // inside this catch.
+                        attemptError = ex;
+                        shouldRefreshToken = credentials.AuthenticationType == EmailSenderAuthenticationType.OAuth2
+                            && IsAuthenticationFailure(ex)
+                            && !refreshedAfterFailure;
                     }
 
-                    return null;
+                    if (!shouldRefreshToken)
+                    {
+                        return attemptError;
+                    }
+
+                    // The OAuth2 token was rejected: refresh it once, then retry against a fresh session.
+                    refreshedAfterFailure = true;
+                    if (!await RefreshOAuthTokenAsync(options, credentials.AccessToken, cancellationToken).ConfigureAwait(false))
+                    {
+                        return attemptError;
+                    }
+
+                    RefreshConnectionInfo(options);
+                    credentials = Volatile.Read(ref _currentCredentials) ?? credentials;
+                    await client.DisconnectAsync(quit: true, cancellationToken).ConfigureAwait(false);
                 }
-                finally
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // Every genuine failure is returned to the caller as the result value. The filter
+                // deliberately excludes OperationCanceledException - cancellation is not caught
+                // here or in the loop, so it propagates out and throws, like the rest of the API.
+                return ex;
+            }
+            finally
+            {
+                if (client is not null)
                 {
                     // Do not pass the cancellation token. We want to disconnect gracefully.
 #pragma warning disable CA2016 // Forward the 'CancellationToken' parameter to methods
@@ -229,10 +274,6 @@ namespace ReconArt.Email
 #pragma warning restore CA2016 // Forward the 'CancellationToken' parameter to methods
                     client.Dispose();
                 }
-            }
-            catch (Exception ex)
-            {
-                return ex;
             }
         }
 
@@ -324,7 +365,16 @@ namespace ReconArt.Email
                 cancellationToken.ThrowIfCancellationRequested();
             }
 
-            EmailSenderOptions? mailOptions = await GetOptionsAsync(cancellationToken).ConfigureAwait(false);
+            EmailSenderOptions? mailOptions;
+            try
+            {
+                mailOptions = await GetOptionsAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch when (ExceptionFilters.DisposeWithoutUnwindingStack(email))
+            {
+                throw;
+            }
+
             if (mailOptions is null)
             {
                 Interlocked.Increment(ref _failedMessagesCount);
@@ -383,6 +433,7 @@ namespace ReconArt.Email
             treatAsSuccess = false;
             try
             {
+                ParserOptions parserOptions = CreateParserOptions(mailOptions);
                 IEnumerable<string> recipients = email.Recipients;
                 HashSet<string> uniqueRecipients = [];
 
@@ -512,7 +563,15 @@ namespace ReconArt.Email
                 MailboxAddress? fromAddress = null;
                 MailboxAddress? senderAddress = null;
 
-                if (mailOptions.RequiresAuthentication && mailOptions.IsUsernameEmailAddress)
+                // Whether the send authenticates under an identity we can derive the From header
+                // from. OAuth2 always authenticates; Basic only when RequiresAuthentication is set
+                // (that flag applies to Basic alone). Keying off AuthenticationType keeps this in
+                // lockstep with what Validate() enforces, so the two can never disagree.
+                bool usesAuthenticatedIdentity =
+                    mailOptions.AuthenticationType == EmailSenderAuthenticationType.OAuth2
+                    || (mailOptions.AuthenticationType == EmailSenderAuthenticationType.Basic && mailOptions.RequiresAuthentication);
+
+                if (usesAuthenticatedIdentity && mailOptions.IsUsernameEmailAddress)
                 {
                     // Defensive check. Under normal conditions should never be hit.
                     if (string.IsNullOrWhiteSpace(mailOptions.Username))
@@ -523,16 +582,16 @@ namespace ReconArt.Email
 
                     if (mailOptions.FromAddress is not null && mailOptions.FromAddress != mailOptions.Username)
                     {
-                        if (!TryParseEmailAddress(mailOptions.FromAddress, "From", out fromAddress))
+                        if (!TryParseEmailAddress(parserOptions, mailOptions.FromAddress, "From", out fromAddress))
                         {
                             return null;
                         }
-                        if (!TryParseEmailAddress(mailOptions.Username, "Sender", out senderAddress))
+                        if (!TryParseEmailAddress(parserOptions, mailOptions.Username, "Sender", out senderAddress))
                         {
                             return null;
                         }
                     }
-                    else if (!TryParseEmailAddress(mailOptions.Username, "From", out fromAddress))
+                    else if (!TryParseEmailAddress(parserOptions, mailOptions.Username, "From", out fromAddress))
                     {
                         return null;
                     }
@@ -547,7 +606,7 @@ namespace ReconArt.Email
                         return null;
                     }
 
-                    if (!TryParseEmailAddress(mailOptions.FromAddress, "From", out fromAddress))
+                    if (!TryParseEmailAddress(parserOptions, mailOptions.FromAddress, "From", out fromAddress))
                     {
                         return null;
                     }
@@ -561,7 +620,7 @@ namespace ReconArt.Email
 
                 foreach (string recipient in filteredRecipients)
                 {
-                    if (MailboxAddress.TryParse(_cachedAddressParserOptions, recipient, out MailboxAddress? emailAdress))
+                    if (MailboxAddress.TryParse(parserOptions, recipient, out MailboxAddress? emailAdress))
                     {
                         mail.To.Add(emailAdress);
                     }
@@ -595,7 +654,35 @@ namespace ReconArt.Email
             }
         }
 
-        private async ValueTask<bool> TryToConnectAndAuthenticateSmtpClientAsync(
+        /// <summary>
+        /// Connects (if needed) and authenticates <paramref name="smtpClient"/> for the given
+        /// credential generation. Shared by the pooled send path and <see cref="TestConnectionAsync"/>.
+        /// Throws on failure; callers classify the exception.
+        /// </summary>
+        private static async Task ConnectAndAuthenticateAsync(SmtpClient smtpClient, ConnectionCredentials credentials, CancellationToken cancellationToken)
+        {
+            if (!smtpClient.IsConnected)
+            {
+                await smtpClient.ConnectAsync(credentials.Host, credentials.Port, SecureSocketOptions.Auto, cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
+            }
+
+            if (credentials.AuthenticationType == EmailSenderAuthenticationType.OAuth2)
+            {
+                if (!smtpClient.IsAuthenticated)
+                {
+                    SaslMechanismOAuth2 oauthMechanism = new(credentials.Username ?? string.Empty, credentials.AccessToken ?? string.Empty);
+                    await smtpClient.AuthenticateAsync(oauthMechanism, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            else if (credentials.RequiresAuthentication && !smtpClient.IsAuthenticated)
+            {
+                await smtpClient.AuthenticateAsync(credentials.Username ?? string.Empty, credentials.Password ?? string.Empty, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+        }
+
+        private async ValueTask<SmtpConnectionResult> TryToConnectAndAuthenticateSmtpClientAsync(
             ConnectionCredentials credentials,
             int connectionIndex,
             SmtpClient smtpClient,
@@ -614,17 +701,7 @@ namespace ReconArt.Email
                     await smtpClient.DisconnectAsync(quit: true, cancellationToken).ConfigureAwait(false);
                 }
 
-                if (!smtpClient.IsConnected)
-                {
-                    await smtpClient.ConnectAsync(credentials.Host, credentials.Port, SecureSocketOptions.Auto, cancellationToken: cancellationToken)
-                        .ConfigureAwait(false);
-                }
-
-                if (credentials.RequiresAuthentication && !smtpClient.IsAuthenticated)
-                {
-                    await smtpClient.AuthenticateAsync(credentials.Username ?? string.Empty, credentials.Password ?? string.Empty, cancellationToken)
-                        .ConfigureAwait(false);
-                }
+                await ConnectAndAuthenticateAsync(smtpClient, credentials, cancellationToken).ConfigureAwait(false);
 
                 // Record the generation only on full success: cancel or fail halfway and the slot
                 // keeps its old (or null) reference, so the next owner sees a mismatch and
@@ -637,13 +714,23 @@ namespace ReconArt.Email
                 // Honor typical async patterns, by keeping cancellation as an exception.
                 throw;
             }
+            catch (Exception ex) when (credentials.AuthenticationType == EmailSenderAuthenticationType.OAuth2 && IsAuthenticationFailure(ex))
+            {
+                _logger.LogWarning(ex, "OAuth2 authentication with the SMTP server failed. A token refresh will be attempted.");
+                return new(false, ShouldRefreshOAuthToken: true, FailFast: false, EmailFailureReason.AuthenticationFailed);
+            }
+            catch (Exception ex) when (IsAuthenticationFailure(ex))
+            {
+                _logger.LogCritical(ex, "Authentication with the SMTP server failed.");
+                return new(false, ShouldRefreshOAuthToken: false, FailFast: true, EmailFailureReason.AuthenticationFailed);
+            }
             catch (Exception ex)
             {
                 _logger.LogCritical(ex, "Critical error in connecting to SMTP server.");
-                return false;
+                return new(false, ShouldRefreshOAuthToken: false, FailFast: false, EmailFailureReason.Unknown);
             }
 
-            return true;
+            return new(true, ShouldRefreshOAuthToken: false, FailFast: false, EmailFailureReason.None);
         }
 
         private async Task<bool> ProcessMessageAsync(QueuedMail queuedMail)
@@ -652,15 +739,15 @@ namespace ReconArt.Email
             {
                 bool wasDisposed = false;
                 EmailSenderOptions? mailOptions;
-                var recipientsFormatted = string.Join(", ", 
+                var recipientsFormatted = string.Join(", ",
                     queuedMail.MimeMessage.To.Cast<MailboxAddress>().Select(static adr => adr.Address));
 
                 _logger.LogInformation("Message for {Recipients} is being processed...", recipientsFormatted);
                 mailOptions = await GetOptionsAsync(queuedMail.CancellationToken).ConfigureAwait(false);
                 if (mailOptions is null)
                 {
-                    _logger.LogInformation(
-                        "Message for {Recipients} could not be processed - no SMTP configuration could be retrieived.",
+                    _logger.LogWarning(
+                        "Message for {Recipients} could not be processed - no SMTP configuration is available.",
                         recipientsFormatted);
 
                     Interlocked.Increment(ref _failedMessagesCount);
@@ -680,7 +767,7 @@ namespace ReconArt.Email
                     }
                     catch (ObjectDisposedException)
                     {
-                        _logger.LogError("Could not send message to SMTP server - object was disposed.");
+                        _logger.LogError("Could not send message to SMTP server - the client was disposed.");
                         wasDisposed = true;
                     }
                     catch (OperationCanceledException) when (LogOperationCancelledWithoutUnwinding(_logger))
@@ -708,9 +795,9 @@ namespace ReconArt.Email
             }
         }
 
-        private bool TryParseEmailAddress(string address, string headerType, [NotNullWhen(true)] out MailboxAddress? parsedAddress)
+        private bool TryParseEmailAddress(ParserOptions parserOptions, string address, string headerType, [NotNullWhen(true)] out MailboxAddress? parsedAddress)
         {
-            if (!MailboxAddress.TryParse(_cachedAddressParserOptions, address, out parsedAddress))
+            if (!MailboxAddress.TryParse(parserOptions, address, out parsedAddress))
             {
                 _logger.LogCritical("Failed to parse {Address} as an email address for the \"{HeaderType}\" header.", address, headerType);
                 return false;
@@ -729,6 +816,7 @@ namespace ReconArt.Email
                     // Acquire paired with the release in RefreshConnectionInfo: observing the new
                     // reference guarantees observing the record's fully-initialized fields.
                     ConnectionCredentials? current = Volatile.Read(ref _currentCredentials);
+
                     Debug.Assert(current is not null,
                         "Connections are only acquired after a successful options fetch, which publishes a credentials snapshot.");
 
@@ -745,7 +833,9 @@ namespace ReconArt.Email
 
         private void ReleaseConnection(int index)
         {
-            // Simply mark as available
+            // Releases the slot. This interlocked exchange is also the release fence that
+            // publishes this owner's plain write to _connectionCredentials[index] to the next
+            // acquirer - do not weaken it to a plain write, or the slot-handoff protocol breaks.
             Interlocked.Exchange(ref _connectionStatus[index], 0);
         }
 
@@ -758,6 +848,7 @@ namespace ReconArt.Email
         {
             EmailFailureReason failureReason = EmailFailureReason.Unknown;
             CancellationToken cancellationToken = queuedMail.CancellationToken;
+            bool refreshedAfterFailure = false;
 
             // To add some resiliency, we'll attempt to send the message a couple of times before giving up.
             int retryCount = mailOptions.RetryCount;
@@ -770,23 +861,63 @@ namespace ReconArt.Email
             {
                 do
                 {
-                    if (await TryToConnectAndAuthenticateSmtpClientAsync(credentials, connectionIndex, smtpClient, cancellationToken).ConfigureAwait(false))
-                    {
-                        (bool Successful, bool FailFast, EmailFailureReason FailureReason) result =
-                            await TrySendingSmtpClientMailMessageAsync(smtpClient, queuedMail.MimeMessage, cancellationToken).ConfigureAwait(false);
+                    SmtpConnectionResult connectionResult =
+                        await TryToConnectAndAuthenticateSmtpClientAsync(credentials, connectionIndex, smtpClient, cancellationToken)
+                            .ConfigureAwait(false);
 
-                        if (result.Successful)
+                    bool shouldRefreshOAuthToken;
+                    bool failFast = false;
+                    if (connectionResult.Successful)
+                    {
+                        SmtpSendResult sendResult =
+                            await TrySendingSmtpClientMailMessageAsync(smtpClient, queuedMail.MimeMessage, credentials, cancellationToken)
+                                .ConfigureAwait(false);
+
+                        if (sendResult.Successful)
                         {
                             queuedMail.Delivered();
                             return true;
                         }
 
-                        failureReason = result.FailureReason;
+                        failureReason = sendResult.FailureReason;
+                        shouldRefreshOAuthToken = sendResult.ShouldRefreshOAuthToken;
+                        failFast = sendResult.FailFast;
+                    }
+                    else
+                    {
+                        failureReason = connectionResult.FailureReason;
+                        shouldRefreshOAuthToken = connectionResult.ShouldRefreshOAuthToken;
+                        failFast = connectionResult.FailFast;
+                    }
 
-                        if (result.FailFast)
+                    if (shouldRefreshOAuthToken)
+                    {
+                        if (refreshedAfterFailure
+                            || !await RefreshOAuthTokenAsync(mailOptions, credentials.AccessToken, cancellationToken).ConfigureAwait(false))
                         {
+                            // The token was already refreshed once for this message, or cannot be
+                            // refreshed: further retries would reuse the same rejected token.
+                            _logger.LogError("Could not send message to SMTP server - OAuth2 authentication failed and could not be recovered by a token refresh.");
                             break;
                         }
+
+                        refreshedAfterFailure = true;
+
+                        // Everywhere else a message retries with the same credentials snapshot it
+                        // acquired at GetConnection, even if a newer one was published meanwhile.
+                        // Honoring that rule here would re-authenticate with the very token the
+                        // server just rejected, so this is the one place a message swaps to the
+                        // newly published snapshot mid-flight.
+                        RefreshConnectionInfo(mailOptions);
+                        credentials = Volatile.Read(ref _currentCredentials) ?? credentials;
+
+                        // Immediate retry - the refresh itself already consumed real time.
+                        continue;
+                    }
+
+                    if (failFast)
+                    {
+                        break;
                     }
 
                     if (!delaysEnumerator.MoveNext())
@@ -797,7 +928,7 @@ namespace ReconArt.Email
 
                     TimeSpan retryDelay = delaysEnumerator.Current;
 
-                    _logger.LogInformation("Retrying in {retryMailDelay}ms to send a message.", retryDelay.TotalMilliseconds);
+                    _logger.LogInformation("Retrying in {RetryMailDelay}ms to send a message.", retryDelay.TotalMilliseconds);
 
                     await Task.Delay(retryDelay, cancellationToken).ConfigureAwait(false);
                 } while (true);
@@ -838,9 +969,10 @@ namespace ReconArt.Email
             return false;
         }
 
-        private async ValueTask<(bool Successful, bool FailFast, EmailFailureReason)> TrySendingSmtpClientMailMessageAsync(
+        private async ValueTask<SmtpSendResult> TrySendingSmtpClientMailMessageAsync(
             SmtpClient smtpClient,
             MimeMessage mail,
+            ConnectionCredentials credentials,
             CancellationToken cancellationToken)
         {
             Debug.Assert(smtpClient.IsConnected,
@@ -851,17 +983,43 @@ namespace ReconArt.Email
                 await smtpClient.SendAsync(mail, cancellationToken).ConfigureAwait(false);
                 _logger.LogInformation("Successfully sent message to {Recipients}.", string.Join(", ",
                     mail.To.Cast<MailboxAddress>().Select(static adr => adr.Address)));
-                return (true, false, EmailFailureReason.None);
+                return new(true, false, false, EmailFailureReason.None);
             }
             catch (ObjectDisposedException)
             {
-                _logger.LogError("Could not send message to SMTP server - object was disposed.");
-                return (false, true, EmailFailureReason.Disposed);
+                _logger.LogError("Could not send message to SMTP server - the client was disposed.");
+                return new(false, true, false, EmailFailureReason.Disposed);
             }
             catch (OperationCanceledException) when (LogOperationCancelledWithoutUnwinding(_logger))
             {
                 // Honor typical async patterns, by keeping cancellation as an exception.
                 throw;
+            }
+            catch (SmtpCommandException ex) when (ex.ErrorCode == SmtpErrorCode.RecipientNotAccepted && IsPermanentSmtpFailure(ex.StatusCode))
+            {
+                _logger.LogError("Could not send message to SMTP server - recipient {Recipient}" +
+                    " was permanently rejected ({StatusCode} {Response}). Mail will be dropped.",
+                    ex.Mailbox?.Address, (int)ex.StatusCode, ex.Message);
+                return new(false, true, false, EmailFailureReason.InvalidAddress);
+            }
+            catch (SmtpCommandException ex) when (ex.ErrorCode == SmtpErrorCode.SenderNotAccepted && IsPermanentSmtpFailure(ex.StatusCode))
+            {
+                _logger.LogCritical("Could not send message to SMTP server as {FromAddress}" +
+                    " - the sender was permanently rejected ({StatusCode} {Response}). " +
+                    "Make sure your account has permission to send from this address.",
+                    ((MailboxAddress)mail.From[0]).Address, (int)ex.StatusCode, ex.Message);
+                return new(false, true, false, EmailFailureReason.SendAsDenied);
+            }
+            catch (SmtpCommandException ex) when (credentials.AuthenticationType == EmailSenderAuthenticationType.OAuth2
+                && ex.StatusCode == SmtpStatusCode.AuthenticationRequired)
+            {
+                _logger.LogWarning(ex, "SMTP server requested re-authentication. A token refresh will be attempted.");
+                return new(false, false, true, EmailFailureReason.AuthenticationFailed);
+            }
+            catch (ServiceNotAuthenticatedException ex) when (credentials.AuthenticationType == EmailSenderAuthenticationType.OAuth2)
+            {
+                _logger.LogWarning(ex, "SMTP client is no longer authenticated. A token refresh will be attempted.");
+                return new(false, false, true, EmailFailureReason.AuthenticationFailed);
             }
             catch (SmtpProtocolException ex)
             {
@@ -874,47 +1032,55 @@ namespace ReconArt.Email
                     _logger.LogError(ex, "Could not send message to SMTP server.");
                 }
 
-                return (false, false, EmailFailureReason.Unknown);
+                return new(false, false, false, EmailFailureReason.Unknown);
             }
-            catch (IOException ex) when (ex.InnerException is not null)
+            catch (IOException ex)
             {
-                _logger.LogError(ex.InnerException, "Could not send message to SMTP server.");
-                return (false, false, EmailFailureReason.Unknown);
+                _logger.LogError(ex, "Could not send message to SMTP server.");
+                return new(false, false, false, EmailFailureReason.Unknown);
             }
-            catch (SmtpCommandException ex) when (ex.Message == INVALID_ADDRESS)
+            catch (ServiceNotAuthenticatedException ex)
             {
-                _logger.LogError("Could not send message to SMTP server due to an invalid address - mail will be dropped.");
-                return (false, true, EmailFailureReason.InvalidAddress);
-            }
-            catch (SmtpCommandException ex) when (ex.Message.StartsWith(SENDER_DENIED))
-            {
-                _logger.LogCritical("Could not send message to SMTP server as {FromAddress}. " +
-                    "Make sure your account has the necessary permissions and that you're using the correct address to send emails from.",
-                    ((MailboxAddress)mail.From[0]).Address);
-                return (false, true, EmailFailureReason.SendAsDenied);
-            }
-            catch (ServiceNotAuthenticatedException)
-            {
-                // This catch block should never be hit. It's just here as a defensive-coding practice in the event
-                // in the future we overlook the Debug.Assert statement.
-                _logger.LogCritical("Attempted to send message to SMTP server when no connection was established with it.");
-                return (false, false, EmailFailureReason.NotConnected);
+                _logger.LogCritical(ex, "Authentication with the SMTP server was rejected while sending.");
+                return new(false, true, false, EmailFailureReason.AuthenticationFailed);
             }
             catch (ServiceNotConnectedException)
             {
-                // This catch block should never be hit. It's just here as a defensive-coding practice in the event
-                // in the future we overlook the Debug.Assert statement.
-                _logger.LogCritical("Attempted to send message to SMTP server when no connection was established with it.");
-                return (false, false, EmailFailureReason.NotConnected);
+                _logger.LogWarning("Could not send message to the SMTP server - the connection to the server was broken.");
+                return new(false, false, false, EmailFailureReason.NotConnected);
             }
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Could not send message to SMTP server.");
-                return (false, false, EmailFailureReason.Unknown);
+                return new(false, false, false, EmailFailureReason.Unknown);
             }
         }
 
-        private async ValueTask<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellation = default)
+        private Task<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellation = default)
+        {
+            while (true)
+            {
+                Task<EmailSenderOptions?>? inFlight = Volatile.Read(ref _optionsFetchTask);
+                if (inFlight is not null)
+                {
+                    // Coalesce onto the in-flight fetch. Each caller awaits with its OWN token, so
+                    // one caller cancelling only abandons its own wait - never the shared fetch.
+                    return inFlight.WaitAsync(cancellation);
+                }
+
+                TaskCompletionSource<EmailSenderOptions?> completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (Interlocked.CompareExchange(ref _optionsFetchTask, completion.Task, null) is null)
+                {
+                    // Won the election: drive the one shared fetch, then wait on it like everyone else.
+                    _ = ExecuteOptionsFetchAsync(completion);
+                    return completion.Task.WaitAsync(cancellation);
+                }
+
+                // Lost the election - loop and join the winner.
+            }
+        }
+
+        private async Task ExecuteOptionsFetchAsync(TaskCompletionSource<EmailSenderOptions?> completion)
         {
             try
             {
@@ -927,26 +1093,42 @@ namespace ReconArt.Email
                 }
                 else
                 {
-                    options = await optionsProvider.GetOptionsAsync(cancellation).ConfigureAwait(false);
+                    // Uncancellable on purpose: this is service-wide work whose result every
+                    // coalesced caller consumes, so no single caller's token may cancel it.
+                    // Callers govern their own responsiveness via WaitAsync in GetOptionsAsync.
+                    options = await optionsProvider.GetOptionsAsync(CancellationToken.None).ConfigureAwait(false);
                 }
 
                 if (options is not null)
                 {
                     ObjectValidator.ValidateObjectOrThrow(options);
 
+                    if (options.AuthenticationType == EmailSenderAuthenticationType.OAuth2)
+                    {
+                        // Proactive: refresh before the token is ever used, so the connect
+                        // path can stay dumb and authenticate with whatever is published.
+                        await EnsureUsableOAuthTokenAsync(options, CancellationToken.None).ConfigureAwait(false);
+                    }
+
                     // Pull-based refresh: one mechanism covers monitor reloads, fresh rows from
                     // the provider, and in-place OAuth token mutations - those sources don't
                     // share a change-notification channel, so pushing can't cover them all.
-                    _cachedAddressParserOptions = CreateParserOptions(options);
+                    // Single-flight makes these publishes non-overlapping, so a stale generation
+                    // can never overwrite a fresher one on the pooled connections.
                     RefreshConnectionInfo(options);
                 }
 
-                return options;
+                completion.TrySetResult(options);
             }
             catch (Exception ex)
             {
                 _logger.LogCritical(ex, "Could not fetch mail options.");
-                return null;
+                completion.TrySetResult(null);
+            }
+            finally
+            {
+                // Reopen the gate only after the publish above - keeps successive fetches ordered.
+                Volatile.Write(ref _optionsFetchTask, null);
             }
         }
 
@@ -955,7 +1137,7 @@ namespace ReconArt.Email
             // Snapshot immediately. Never compare against or cache the live options instance -
             // the OAuth refresh callback mutates it in place, which would make the comparison
             // vacuously true whenever the cached and incoming references are the same object.
-            ConnectionCredentials incoming = ConnectionCredentials.From(options);
+            ConnectionCredentials incoming = OverlayRefreshedOAuthToken(ConnectionCredentials.From(options));
 
             ConnectionCredentials? current = Volatile.Read(ref _currentCredentials);
             while (true)
@@ -983,6 +1165,247 @@ namespace ReconArt.Email
             }
         }
 
+        /// <summary>
+        /// Decides whose OAuth2 token goes into the published snapshot: the options source's,
+        /// or the one the service refreshed itself (<see cref="_oauthTokenState"/>).
+        /// </summary>
+        /// <remarks>
+        /// An options source (e.g. a database-backed provider) may keep materializing fresh
+        /// instances that still carry the token our refresh already superseded - without this
+        /// overlay, every message would trigger a refresh. Conversely, a token we have never
+        /// seen means the source changed outside of us, so it becomes authoritative again and
+        /// the service's token memory is dropped.
+        /// </remarks>
+        private ConnectionCredentials OverlayRefreshedOAuthToken(ConnectionCredentials incoming)
+        {
+            if (incoming.AuthenticationType != EmailSenderAuthenticationType.OAuth2)
+            {
+                return incoming;
+            }
+
+            OAuthTokenState? state = Volatile.Read(ref _oauthTokenState);
+            if (state is null)
+            {
+                return incoming;
+            }
+
+            if (string.Equals(incoming.AccessToken, state.ReplacedSourceToken, StringComparison.Ordinal))
+            {
+                // The source still serves the token we already refreshed past - ours supersedes
+                // it. This is what keeps a provider that materializes stale persisted rows from
+                // triggering a refresh per message.
+                return incoming with { AccessToken = state.AccessToken };
+            }
+
+            if (!string.Equals(incoming.AccessToken, state.AccessToken, StringComparison.Ordinal))
+            {
+                // The source presented a token we don't recognize (config reload, credential
+                // rotation, or a provider that caught up via persistence): the source is
+                // authoritative again.
+                Interlocked.CompareExchange(ref _oauthTokenState, null, state);
+            }
+
+            return incoming;
+        }
+
+        private (string? AccessToken, DateTime ExpiresAtUtc) GetEffectiveOAuthToken(EmailSenderOptions options)
+        {
+            OAuthTokenState? state = Volatile.Read(ref _oauthTokenState);
+            if (state is not null
+                && (string.Equals(options.AccessToken, state.ReplacedSourceToken, StringComparison.Ordinal)
+                    || string.Equals(options.AccessToken, state.AccessToken, StringComparison.Ordinal)))
+            {
+                return (state.AccessToken, state.ExpiresAtUtc);
+            }
+
+            return (options.AccessToken, options.AccessTokenExpiresAtUtc);
+        }
+
+        private async ValueTask EnsureUsableOAuthTokenAsync(EmailSenderOptions options, CancellationToken cancellationToken)
+        {
+            // A default expiry means "unknown", not "expired".
+            (string? accessToken, DateTime expiresAtUtc) = GetEffectiveOAuthToken(options);
+
+            if (!string.IsNullOrWhiteSpace(accessToken)
+                && (expiresAtUtc == default || expiresAtUtc > DateTime.UtcNow + OAuthTokenExpirySkew))
+            {
+                return;
+            }
+
+            // Failure is tolerated here: the message proceeds with whatever token is published
+            // and fails through the authentication path, which reports AuthenticationFailed.
+            await RefreshOAuthTokenAsync(options, accessToken, cancellationToken).ConfigureAwait(false);
+        }
+
+        private Task<bool> RefreshOAuthTokenAsync(EmailSenderOptions options, string? staleAccessToken, CancellationToken cancellationToken)
+        {
+            while (true)
+            {
+                Task<bool>? inFlight = Volatile.Read(ref _oauthRefreshTask);
+                if (inFlight is not null)
+                {
+                    // Join the ongoing refresh instead of stampeding the token endpoint.
+                    return inFlight.WaitAsync(cancellationToken);
+                }
+
+                // A refresh may have already superseded the token we're complaining about,
+                // while we were busy failing with it. If so, the fresh token is already
+                // published - the caller only needs to re-pull.
+                (string? effectiveToken, _) = GetEffectiveOAuthToken(options);
+                if (!string.Equals(effectiveToken, staleAccessToken, StringComparison.Ordinal))
+                {
+                    return Task.FromResult(true);
+                }
+
+                OAuthRefreshFailure? recentFailure = Volatile.Read(ref _oauthRefreshFailure);
+                if (recentFailure is not null
+                    && DateTime.UtcNow.Ticks - recentFailure.TimestampTicks < OAuthRefreshFailureCooldown.Ticks
+                    && string.Equals(options.AccessToken, recentFailure.SourceAccessToken, StringComparison.Ordinal))
+                {
+                    // A recent refresh attempt against this same source credential failed -
+                    // fail fast during the cooldown instead of hammering the token endpoint
+                    // once per queued message. A different source token bypasses the cooldown:
+                    // rotated credentials carry a refresh token that has never been tried.
+                    return Task.FromResult(false);
+                }
+
+                TaskCompletionSource<bool> refreshCompletion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+                if (Interlocked.CompareExchange(ref _oauthRefreshTask, refreshCompletion.Task, null) is null)
+                {
+                    return ExecuteOAuthRefreshAsync(options, refreshCompletion, cancellationToken);
+                }
+
+                // Lost the election - loop around and join the winner.
+            }
+        }
+
+        private async Task<bool> ExecuteOAuthRefreshAsync(
+            EmailSenderOptions options,
+            TaskCompletionSource<bool> refreshCompletion,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>>? refreshAccessTokenAsync = options.RefreshAccessTokenAsync;
+                if (refreshAccessTokenAsync is null)
+                {
+                    // Unreachable through validated options; defensive for manually-mutated instances.
+                    _logger.LogCritical("An OAuth2 token refresh is required, but no {CallbackName} callback is configured.",
+                        nameof(EmailSenderOptions.RefreshAccessTokenAsync));
+                    Volatile.Write(ref _oauthRefreshFailure, new OAuthRefreshFailure(DateTime.UtcNow.Ticks, options.AccessToken));
+                    refreshCompletion.TrySetResult(false);
+                    return false;
+                }
+
+                EmailSenderOAuthRefreshResult refreshResult = await refreshAccessTokenAsync(cancellationToken).ConfigureAwait(false);
+                ValidateOAuthRefreshResult(refreshResult);
+
+                // The winner's fetched options represent the source view this refresh
+                // supersedes - the overlay keeps applying while the source serves that token.
+                OAuthTokenState refreshedState = new(
+                    refreshResult.AccessToken,
+                    refreshResult.AccessTokenExpiresAtUtc,
+                    refreshResult.RefreshToken,
+                    ReplacedSourceToken: options.AccessToken);
+
+                Volatile.Write(ref _oauthTokenState, refreshedState);
+                Volatile.Write(ref _oauthRefreshFailure, null);
+
+                // Documented contract: refreshed values are applied onto the current options instance.
+                options.AccessToken = refreshResult.AccessToken;
+                options.AccessTokenExpiresAtUtc = refreshResult.AccessTokenExpiresAtUtc;
+                if (refreshResult.RefreshToken is not null)
+                {
+                    options.RefreshToken = refreshResult.RefreshToken;
+                }
+
+                _logger.LogInformation("OAuth2 access token was refreshed.");
+
+                // Unblock joiners before the persistence callback: they only need the token,
+                // and the callback may do slow I/O.
+                refreshCompletion.TrySetResult(true);
+
+                await InvokeOAuthCredentialsRefreshedAsync(options, refreshResult, cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+            catch (OperationCanceledException)
+            {
+                // Cancellation is not a token refresh failure.
+                // Let joiners handle it themselves.
+                _logger.LogInformation("OAuth2 token refresh was canceled.");
+                refreshCompletion.TrySetResult(false);
+                throw;
+            }
+            catch (Exception ex)
+            {
+                Volatile.Write(ref _oauthRefreshFailure, new OAuthRefreshFailure(DateTime.UtcNow.Ticks, options.AccessToken));
+                _logger.LogError(ex, "Could not refresh OAuth2 access token.");
+                refreshCompletion.TrySetResult(false);
+                return false;
+            }
+            finally
+            {
+                Volatile.Write(ref _oauthRefreshTask, null);
+            }
+        }
+
+        private async ValueTask InvokeOAuthCredentialsRefreshedAsync(
+            EmailSenderOptions options,
+            EmailSenderOAuthRefreshResult refreshResult,
+            CancellationToken cancellationToken)
+        {
+            Func<EmailSenderOAuthRefreshResult, CancellationToken, ValueTask>? onRefreshed = options.OnOAuth2CredentialsRefreshed;
+            if (onRefreshed is null)
+            {
+                return;
+            }
+
+            try
+            {
+                await onRefreshed(refreshResult, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Caught exception in user-provided delegate.");
+            }
+        }
+
+        private static void ValidateOAuthRefreshResult(EmailSenderOAuthRefreshResult refreshResult)
+        {
+            ArgumentNullException.ThrowIfNull(refreshResult);
+
+            if (string.IsNullOrWhiteSpace(refreshResult.AccessToken))
+            {
+                throw new InvalidOperationException("RefreshAccessTokenAsync returned an empty access token.");
+            }
+
+            // A default expiry is allowed - RFC 6749 only RECOMMENDS expires_in in the token
+            // response, so a delegate may legitimately not know it. The token is then used
+            // until the server rejects it. A known-past expiry, however, is a caller bug.
+            if (refreshResult.AccessTokenExpiresAtUtc != default && refreshResult.AccessTokenExpiresAtUtc <= DateTime.UtcNow)
+            {
+                throw new InvalidOperationException("RefreshAccessTokenAsync returned an already expired access token.");
+            }
+        }
+
+        private static bool IsPermanentSmtpFailure(SmtpStatusCode statusCode) =>
+            // 5xx is a permanent SMTP failure (4xx is transient and should be retried).
+            (int)statusCode is >= 500 and < 600
+            // Auth-related 5xx codes belong to the authentication paths, not to permanent
+            // address rejection - keep them out so they still reach the OAuth refresh / auth handling.
+            && statusCode is not (SmtpStatusCode.AuthenticationRequired
+                or SmtpStatusCode.AuthenticationMechanismTooWeak
+                or SmtpStatusCode.AuthenticationInvalidCredentials);
+
+        private static bool IsAuthenticationFailure(Exception ex) =>
+            ex is AuthenticationException
+                or SmtpCommandException
+                {
+                    StatusCode: SmtpStatusCode.AuthenticationRequired
+                        or SmtpStatusCode.AuthenticationMechanismTooWeak
+                        or SmtpStatusCode.AuthenticationInvalidCredentials
+                };
+
         private static ParserOptions CreateParserOptions(EmailSenderOptions options) => new()
         {
             AddressParserComplianceMode = options.UseStrictAddressParser ? RfcComplianceMode.Strict : RfcComplianceMode.Loose,
@@ -993,7 +1416,7 @@ namespace ReconArt.Email
 
         private static bool LogOperationCancelledWithoutUnwinding(ILogger<EmailSenderService> logger)
         {
-            logger.LogInformation("Could not send message to SMTP server - operation was canceled.");
+            logger.LogInformation("SMTP operation was canceled.");
             return false;
         }
 
@@ -1025,9 +1448,11 @@ namespace ReconArt.Email
             int Port,
             string? Username,
             string? Password,
-            string? AccessToken,
-            string? RefreshToken)
+            string? AccessToken)
         {
+            // RefreshToken is deliberately absent: it never touches the wire, so it must not
+            // participate in value-equality - otherwise a source rotating only the refresh token
+            // would publish a new generation and needlessly tear down every pooled session.
             public static ConnectionCredentials From(EmailSenderOptions options) => new(
                 options.AuthenticationType,
                 options.RequiresAuthentication,
@@ -1035,8 +1460,34 @@ namespace ReconArt.Email
                 options.Port,
                 options.Username,
                 options.Password,
-                options.AccessToken,
-                options.RefreshToken);
+                options.AccessToken);
         }
+
+        /// <summary>
+        /// The OAuth2 token generation the service refreshed itself, superseding the token
+        /// supplied by the options source until the source presents a different one.
+        /// </summary>
+        private sealed record OAuthTokenState(
+            string AccessToken,
+            DateTime ExpiresAtUtc,
+            string? RefreshToken,
+            string? ReplacedSourceToken);
+
+        /// <summary>
+        /// A failed refresh attempt, keyed to the source access token it was attempted for.
+        /// </summary>
+        private sealed record OAuthRefreshFailure(long TimestampTicks, string? SourceAccessToken);
+
+        private readonly record struct SmtpConnectionResult(
+            bool Successful,
+            bool ShouldRefreshOAuthToken,
+            bool FailFast,
+            EmailFailureReason FailureReason);
+
+        private readonly record struct SmtpSendResult(
+            bool Successful,
+            bool FailFast,
+            bool ShouldRefreshOAuthToken,
+            EmailFailureReason FailureReason);
     }
 }
