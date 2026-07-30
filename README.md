@@ -6,7 +6,7 @@ Collection of packages that enrich e-mail functionality.
 
 | Package | Description |
 |---------|-------------|
-| [ReconArt.Email.Sender](https://github.com/ReconArt/email-sdk/tree/main/src/EmailSender/Email.Sender) | Core implementation for sending emails with SMTP connection pooling, retry logic, and comprehensive configuration options. |
+| [ReconArt.Email.Sender](https://github.com/ReconArt/email-sdk/tree/main/src/EmailSender/Email.Sender) | Core implementation for sending emails with SMTP connection pooling, OAuth2 authentication, dynamic runtime configuration, retry logic, and comprehensive configuration options. |
 | [ReconArt.Email.Sender.Abstractions](https://github.com/ReconArt/email-sdk/tree/main/src/EmailSender/Email.Sender.Abstractions) | Interface definitions and models for the email sender functionality, allowing for loose coupling in your applications. |
 | [ReconArt.Email.Sender.Identity](https://github.com/ReconArt/email-sdk/tree/main/src/EmailSender/Email.Sender.Identity) | Extends support for ASP.NET Identity. |
 
@@ -26,6 +26,8 @@ Each package has detailed documentation in its respective repository.
 
 ## Features
 
+- OAuth2 authentication with automatic token refresh (proactive and reactive)
+- Dynamic runtime configuration from a database, cache, or secret store
 - Efficient SMTP connection pooling
 - Comprehensive retry policies with jitter
 - Support for email attachments and inline content
