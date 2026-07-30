@@ -53,5 +53,10 @@
         /// - Other issues verified during MIME message creation.
         /// </remarks>
         InvalidParameters = 6,
+
+        /// <summary>
+        /// Authentication with the email server failed and the operation could not be recovered.
+        /// </summary>
+        AuthenticationFailed = 7,
     }
 }

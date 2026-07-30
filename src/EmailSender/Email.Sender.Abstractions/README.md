@@ -6,9 +6,13 @@ This package contains the core abstractions for the ReconArt.Email.Sender packag
 - `IEmailMessage` for creating email messages.
 - `IEmailAttachment` to attach embedded or regular files to emails.
 - `IEmailSenderService` for the contract of the email sending service.
+- `IEmailSenderOptionsProvider` to supply email sender options from a custom runtime source.
 - `IEmailSenderLivenessService` to check the liveness of the email sending service.
 - `EmailFailureReason` to provide a reason for email sending failure.
+- `EmailSenderAuthenticationType` to select between basic SMTP and OAuth2.
 - `EmailSenderOptions` to configure the email sending service.
+- `EmailSenderStartupOptions` to configure fixed startup settings (connection pool size, message queue size, and certificate validation).
+- `EmailSenderOAuthRefreshResult` to return refreshed OAuth2 token values.
 - `EmailSenderLivenessOptions` to configure the email sending liveness service.
 - `EmailSenderLivenessSnapshot` to represent a liveness snapshot of the email sending service.
 
