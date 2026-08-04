@@ -115,6 +115,127 @@ public sealed class EmailSenderServiceOAuthTests
     }
 
     [Fact]
+    public async Task TestConnectionAsync_WithPassedBasicOptions_UsesCandidateOptionsWithoutFetchingRuntimeProvider()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredBasicPassword = "candidate-password";
+        TestEmailSenderOptionsProvider provider = new(CreateBasicOptions(server.Port, requiresAuthentication: true, password: "runtime-password"));
+        await using EmailSenderService service = CreateService(provider);
+        EmailSenderOptions candidateOptions = CreateBasicOptions(server.Port, requiresAuthentication: true, password: "candidate-password");
+
+        Exception? exception = await service.TestConnectionAsync(candidateOptions);
+
+        Assert.Null(exception);
+        Assert.Equal(0, provider.Calls);
+        SmtpSession session = Assert.Single(server.SnapshotSessions());
+        Assert.Equal("candidate-password", session.BasicPassword);
+        Assert.False(session.CarriedMail);
+        Assert.True(session.SentQuit);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithPassedOptions_DoesNotDisturbRuntimeConnection()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredBasicPassword = "runtime-password";
+        EmailSenderOptions runtimeOptions = CreateBasicOptions(server.Port, requiresAuthentication: true, password: "runtime-password");
+        await using EmailSenderService service = CreateService(runtimeOptions);
+
+        Assert.True(await service.TrySendAsync(new EmailMessage("first@example.com", "Subject", "Body")));
+
+        server.RequiredBasicPassword = "candidate-password";
+        EmailSenderOptions candidateOptions = CreateBasicOptions(server.Port, requiresAuthentication: true, password: "candidate-password");
+        Exception? exception = await service.TestConnectionAsync(candidateOptions);
+
+        Assert.Null(exception);
+
+        server.RequiredBasicPassword = "runtime-password";
+        Assert.True(await service.TrySendAsync(new EmailMessage("second@example.com", "Subject", "Body")));
+
+        List<SmtpSession> sessions = server.SnapshotSessions();
+        SmtpSession runtimeSession = Assert.Single(sessions, static s => s.BasicPassword == "runtime-password");
+        SmtpSession candidateSession = Assert.Single(sessions, static s => s.BasicPassword == "candidate-password");
+        Assert.Equal(2, runtimeSession.DataCount);
+        Assert.False(candidateSession.CarriedMail);
+        Assert.True(candidateSession.SentQuit);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithPassedOAuthOptions_RefreshesAndRetriesRejectedTokenWithoutFetchingRuntimeProvider()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "accepted-token";
+        int refreshCalls = 0;
+        TestEmailSenderOptionsProvider provider = new(CreateOAuth2Options(server.Port, "runtime-token", DateTime.UtcNow.AddMinutes(30), _ =>
+        {
+            throw new InvalidOperationException("Runtime refresh callback should not be used.");
+        }));
+        await using EmailSenderService service = CreateService(provider);
+        EmailSenderOptions candidateOptions = CreateOAuth2Options(server.Port, "rejected-token", DateTime.UtcNow.AddMinutes(30), _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            return ValueTask.FromResult(RefreshResult("accepted-token"));
+        });
+
+        Exception? exception = await service.TestConnectionAsync(candidateOptions);
+
+        Assert.Null(exception);
+        Assert.Equal(0, provider.Calls);
+        Assert.Equal(1, refreshCalls);
+        Assert.Equal("accepted-token", candidateOptions.AccessToken);
+        List<SmtpSession> sessions = server.SnapshotSessions();
+        Assert.Equal(2, sessions.Count);
+        Assert.Equal(["rejected-token"], sessions[0].OAuthTokens);
+        Assert.True(sessions[0].SentQuit);
+        Assert.Equal(["accepted-token"], sessions[1].OAuthTokens);
+        Assert.True(sessions[1].SentQuit);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithPassedOAuthOptionsWithoutInitialToken_RefreshesBeforeConnecting()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "accepted-token";
+        int refreshCalls = 0;
+        await using EmailSenderService service = CreateService(CreateBasicOptions(server.Port, requiresAuthentication: false));
+        EmailSenderOptions candidateOptions = CreateOAuth2Options(server.Port, accessToken: null, default, _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            return ValueTask.FromResult(RefreshResult("accepted-token"));
+        });
+
+        Exception? exception = await service.TestConnectionAsync(candidateOptions);
+
+        Assert.Null(exception);
+        Assert.Equal(1, refreshCalls);
+        Assert.Equal("accepted-token", candidateOptions.AccessToken);
+        SmtpSession session = Assert.Single(server.SnapshotSessions());
+        Assert.Equal(["accepted-token"], session.OAuthTokens);
+        Assert.True(session.SentQuit);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithPassedOAuthOptionsWithUnknownExpiry_UsesTokenWithoutRefreshing()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "candidate-token";
+        int refreshCalls = 0;
+        await using EmailSenderService service = CreateService(CreateBasicOptions(server.Port, requiresAuthentication: false));
+        EmailSenderOptions candidateOptions = CreateOAuth2Options(server.Port, "candidate-token", default, _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            return ValueTask.FromResult(RefreshResult("unused-token"));
+        });
+
+        Exception? exception = await service.TestConnectionAsync(candidateOptions);
+
+        Assert.Null(exception);
+        Assert.Equal(0, refreshCalls);
+        SmtpSession session = Assert.Single(server.SnapshotSessions());
+        Assert.Equal(["candidate-token"], session.OAuthTokens);
+    }
+
+    [Fact]
     public async Task TrySendAsync_OAuth2_ConcurrentExpiredToken_RefreshesOnce()
     {
         await using TestSmtpServer server = new();
@@ -747,10 +868,13 @@ internal sealed class TestEmailSenderOptionsProvider(EmailSenderOptions? options
     private readonly object _lock = new();
     private EmailSenderOptions? _options = options;
 
+    public int Calls { get; private set; }
+
     public ValueTask<EmailSenderOptions?> GetOptionsAsync(CancellationToken cancellationToken)
     {
         lock (_lock)
         {
+            Calls++;
             return ValueTask.FromResult(_options);
         }
     }

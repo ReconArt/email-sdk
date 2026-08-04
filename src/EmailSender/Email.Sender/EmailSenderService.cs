@@ -278,6 +278,84 @@ namespace ReconArt.Email
         }
 
         /// <inheritdoc/>
+        public async ValueTask<Exception?> TestConnectionAsync(EmailSenderOptions options, CancellationToken cancellationToken = default)
+        {
+            SmtpClient? client = null;
+            try
+            {
+                if (options is null)
+                {
+                    return new InvalidOperationException("Email sender is not configured.");
+                }
+
+                ObjectValidator.ValidateObjectOrThrow(options);
+
+                client = new SmtpClient();
+                if (_startupOptions.ServerCertificateValidationCallback is not null)
+                {
+                    client.ServerCertificateValidationCallback = _startupOptions.ServerCertificateValidationCallback;
+                }
+
+                await EnsureUsableCandidateOAuthTokenAsync(options, cancellationToken).ConfigureAwait(false);
+
+                ConnectionCredentials credentials = ConnectionCredentials.From(options);
+                bool refreshedAfterFailure = false;
+                bool shouldRefreshToken;
+                while (true)
+                {
+                    Exception? attemptError;
+                    try
+                    {
+                        await ConnectAndAuthenticateAsync(client, credentials, cancellationToken).ConfigureAwait(false);
+                        return null;
+                    }
+                    catch (Exception ex) when (ex is not OperationCanceledException)
+                    {
+                        attemptError = ex;
+                        shouldRefreshToken = credentials.AuthenticationType == EmailSenderAuthenticationType.OAuth2
+                            && IsAuthenticationFailure(ex)
+                            && !refreshedAfterFailure;
+                    }
+
+                    if (!shouldRefreshToken)
+                    {
+                        return attemptError;
+                    }
+
+                    refreshedAfterFailure = true;
+                    if (!await RefreshCandidateOAuthTokenAsync(options, cancellationToken).ConfigureAwait(false))
+                    {
+                        return attemptError;
+                    }
+
+                    credentials = ConnectionCredentials.From(options);
+                    if (client.IsConnected)
+                    {
+                        await client.DisconnectAsync(quit: true, cancellationToken).ConfigureAwait(false);
+                    }
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                return ex;
+            }
+            finally
+            {
+                if (client is not null)
+                {
+                    // Do not pass the cancellation token. We want to disconnect gracefully.
+#pragma warning disable CA2016 // Forward the 'CancellationToken' parameter to methods
+                    if (client.IsConnected)
+                    {
+                        await client.DisconnectAsync(true).ConfigureAwait(false);
+                    }
+#pragma warning restore CA2016 // Forward the 'CancellationToken' parameter to methods
+                    client.Dispose();
+                }
+            }
+        }
+
+        /// <inheritdoc/>
         public int GetFailedMessagesCount() => Volatile.Read(ref _failedMessagesCount);
 
         /// <inheritdoc/>
@@ -656,7 +734,8 @@ namespace ReconArt.Email
 
         /// <summary>
         /// Connects (if needed) and authenticates <paramref name="smtpClient"/> for the given
-        /// credential generation. Shared by the pooled send path and <see cref="TestConnectionAsync"/>.
+        /// credential generation. Shared by the pooled send path, <see cref="TestConnectionAsync(CancellationToken)"/>,
+        /// and <see cref="TestConnectionAsync(EmailSenderOptions, CancellationToken)"/>.
         /// Throws on failure; callers classify the exception.
         /// </summary>
         private static async Task ConnectAndAuthenticateAsync(SmtpClient smtpClient, ConnectionCredentials credentials, CancellationToken cancellationToken)
@@ -680,6 +759,48 @@ namespace ReconArt.Email
                 await smtpClient.AuthenticateAsync(credentials.Username ?? string.Empty, credentials.Password ?? string.Empty, cancellationToken)
                     .ConfigureAwait(false);
             }
+        }
+
+        private async ValueTask EnsureUsableCandidateOAuthTokenAsync(EmailSenderOptions options, CancellationToken cancellationToken)
+        {
+            if (options.AuthenticationType != EmailSenderAuthenticationType.OAuth2)
+            {
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(options.AccessToken)
+                && (options.AccessTokenExpiresAtUtc == default || options.AccessTokenExpiresAtUtc > DateTime.UtcNow + OAuthTokenExpirySkew))
+            {
+                return;
+            }
+
+            if (!await RefreshCandidateOAuthTokenAsync(options, cancellationToken).ConfigureAwait(false)
+                && string.IsNullOrWhiteSpace(options.AccessToken))
+            {
+                throw new InvalidOperationException("OAuth2 access token is missing and could not be refreshed.");
+            }
+        }
+
+        private async ValueTask<bool> RefreshCandidateOAuthTokenAsync(EmailSenderOptions options, CancellationToken cancellationToken)
+        {
+            Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>>? refreshAccessTokenAsync = options.RefreshAccessTokenAsync;
+            if (refreshAccessTokenAsync is null)
+            {
+                return false;
+            }
+
+            EmailSenderOAuthRefreshResult refreshResult = await refreshAccessTokenAsync(cancellationToken).ConfigureAwait(false);
+            ValidateOAuthRefreshResult(refreshResult);
+
+            options.AccessToken = refreshResult.AccessToken;
+            options.AccessTokenExpiresAtUtc = refreshResult.AccessTokenExpiresAtUtc;
+            if (refreshResult.RefreshToken is not null)
+            {
+                options.RefreshToken = refreshResult.RefreshToken;
+            }
+
+            await InvokeOAuthCredentialsRefreshedAsync(options, refreshResult, cancellationToken).ConfigureAwait(false);
+            return true;
         }
 
         private async ValueTask<SmtpConnectionResult> TryToConnectAndAuthenticateSmtpClientAsync(
@@ -1400,11 +1521,11 @@ namespace ReconArt.Email
         private static bool IsAuthenticationFailure(Exception ex) =>
             ex is AuthenticationException
                 or SmtpCommandException
-                {
-                    StatusCode: SmtpStatusCode.AuthenticationRequired
+            {
+                StatusCode: SmtpStatusCode.AuthenticationRequired
                         or SmtpStatusCode.AuthenticationMechanismTooWeak
                         or SmtpStatusCode.AuthenticationInvalidCredentials
-                };
+            };
 
         private static ParserOptions CreateParserOptions(EmailSenderOptions options) => new()
         {

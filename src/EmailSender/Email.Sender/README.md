@@ -194,6 +194,36 @@ The monitor should return a non-null `CurrentValue`. If credentials do not exist
 
 For OAuth2, the sender updates `AccessToken`, `AccessTokenExpiresAtUtc`, and `RefreshToken` when a refreshed refresh token is returned. Use `OnOAuth2CredentialsRefreshed` when the application needs to persist or observe those refreshed credentials. Exceptions thrown by user-provided delegates are logged and do not fail the send operation.
 
+Before publishing candidate settings from a setup screen or external provider, call `TestConnectionAsync(candidateOptions)` with the candidate `EmailSenderOptions`. This overload validates the supplied options and performs a one-off SMTP connect/authentication probe without fetching runtime options, reusing pooled sender connections, or changing the sender's current configuration.
+
+```csharp
+EmailSenderOptions candidateOptions = EmailSenderOptions.CreateOAuth2(
+    host: settings.Host,
+    port: settings.Port,
+    username: settings.Username,
+    accessToken: token.AccessToken,
+    accessTokenExpiresAtUtc: token.ExpiresAtUtc,
+    refreshToken: token.RefreshToken,
+    refreshAccessTokenAsync: async cancellationToken =>
+    {
+        var refreshed = await tokenProvider.RefreshAsync(settings.RefreshToken, cancellationToken);
+        return new EmailSenderOAuthRefreshResult
+        {
+            AccessToken = refreshed.AccessToken,
+            RefreshToken = refreshed.RefreshToken,
+            AccessTokenExpiresAtUtc = refreshed.ExpiresAtUtc
+        };
+    });
+
+Exception? connectionError = await emailSenderService.TestConnectionAsync(candidateOptions, cancellationToken);
+if (connectionError is null)
+{
+    await settingsStore.SaveAsync(settings, token, cancellationToken);
+}
+```
+
+For OAuth2 candidate tests, the access token and expiration can be omitted or expired. The overload refreshes through the supplied candidate options before connecting when needed, and refreshes/retries once if the SMTP server rejects the candidate token. Any refreshed values are applied to the candidate options instance and its `OnOAuth2CredentialsRefreshed` callback may run; runtime sender options and pooled connections are not touched.
+
 ```csharp
 public sealed class DatabaseEmailSenderOptionsMonitor : IOptionsMonitor<EmailSenderOptions>
 {

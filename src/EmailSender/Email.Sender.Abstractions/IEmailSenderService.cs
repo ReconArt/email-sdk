@@ -41,6 +41,22 @@ namespace ReconArt.Email
         ValueTask<Exception?> TestConnectionAsync(CancellationToken cancellationToken = default);
 
         /// <summary>
+        /// Tests the connection to the email server with the given options.
+        /// </summary>
+        /// <remarks>
+        /// The supplied options are validated and used for a one-off SMTP connect/authentication
+        /// probe. Runtime options and pooled sender connections are not fetched, refreshed, or reused.
+        /// For OAuth2, missing, expired, or rejected candidate access tokens are refreshed using the
+        /// callbacks on the supplied options instance.
+        /// </remarks>
+        /// <param name="options">Options to validate and test.</param>
+        /// <param name="cancellationToken">Cancellation token.</param>
+        /// <returns>
+        /// A <see cref="ValueTask{TResult}"/> containing the <see cref="Exception"/> thrown during the test, if any.
+        /// </returns>
+        ValueTask<Exception?> TestConnectionAsync(EmailSenderOptions options, CancellationToken cancellationToken = default);
+
+        /// <summary>
         /// Returns the number of unsuccessfully sent email messages.
         /// </summary>
         /// <returns>
