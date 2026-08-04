@@ -1426,7 +1426,6 @@ namespace ReconArt.Email
                 OAuthTokenState refreshedState = new(
                     refreshResult.AccessToken,
                     refreshResult.AccessTokenExpiresAtUtc,
-                    refreshResult.RefreshToken,
                     ReplacedSourceToken: options.AccessToken);
 
                 Volatile.Write(ref _oauthTokenState, refreshedState);
@@ -1588,10 +1587,14 @@ namespace ReconArt.Email
         /// The OAuth2 token generation the service refreshed itself, superseding the token
         /// supplied by the options source until the source presents a different one.
         /// </summary>
+        /// <remarks>
+        /// Deliberately carries no refresh token: the sender never reads one - a rotated
+        /// refresh token is written straight onto the options instance for the consumer's
+        /// delegate, and never participates in any of the sender's own state.
+        /// </remarks>
         private sealed record OAuthTokenState(
             string AccessToken,
             DateTime ExpiresAtUtc,
-            string? RefreshToken,
             string? ReplacedSourceToken);
 
         /// <summary>
