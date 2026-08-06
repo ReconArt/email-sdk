@@ -1,3 +1,4 @@
+using MailKit.Security;
 using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Extensions.Options;
 using System.ComponentModel.DataAnnotations;
@@ -233,6 +234,258 @@ public sealed class EmailSenderServiceOAuthTests
         Assert.Equal(0, refreshCalls);
         SmtpSession session = Assert.Single(server.SnapshotSessions());
         Assert.Equal(["candidate-token"], session.OAuthTokens);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithPassedOptions_WrongPassword_ReturnsExceptionInsteadOfThrowing()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredBasicPassword = "the-real-password";
+        await using EmailSenderService service = CreateService(CreateBasicOptions(server.Port, requiresAuthentication: false));
+
+        EmailSenderOptions candidateOptions = CreateBasicOptions(server.Port, requiresAuthentication: true, password: "wrong-password");
+        Exception? exception = await service.TestConnectionAsync(candidateOptions);
+
+        // The overload's core contract: a failing probe RETURNS the failure, never throws it -
+        // and the failure is the server's own rejection, so callers can classify it.
+        Assert.IsType<AuthenticationException>(exception);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithNullOptions_ThrowsArgumentNullException()
+    {
+        await using TestSmtpServer server = new();
+        await using EmailSenderService service = CreateService(CreateBasicOptions(server.Port, requiresAuthentication: false));
+
+        // Thrown EAGERLY at the call site - not captured into the ValueTask, where an
+        // abandoned task would swallow it unobserved.
+        Assert.Throws<ArgumentNullException>(() => _ = service.TestConnectionAsync((EmailSenderOptions)null!));
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithInvalidOptions_ReturnsValidationException()
+    {
+        await using TestSmtpServer server = new();
+        await using EmailSenderService service = CreateService(CreateBasicOptions(server.Port, requiresAuthentication: false));
+
+        // Missing required Host - never reaches the wire; the validation error is the result.
+        Exception? exception = await service.TestConnectionAsync(new EmailSenderOptions());
+
+        Assert.IsType<ValidationException>(exception);
+        Assert.Empty(server.SnapshotSessions());
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithPassedOAuthOptions_ThrowingRefreshDelegate_ReturnsFailure()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "token-nobody-has";
+        await using EmailSenderService service = CreateService(CreateBasicOptions(server.Port, requiresAuthentication: false));
+
+        // No initial token and a dead refresh delegate: the proactive refresh failure is
+        // tolerated (mirroring the runtime path) and the resulting auth failure is returned.
+        EmailSenderOptions candidateOptions = CreateOAuth2Options(server.Port, accessToken: null, default,
+            _ => throw new InvalidOperationException("Token endpoint is down."));
+
+        Exception? exception = await service.TestConnectionAsync(candidateOptions);
+
+        // The result is the server's rejection of the (empty) token - never the refresh
+        // delegate's own exception.
+        Assert.IsType<AuthenticationException>(exception);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithPassedOAuthOptions_HttpTimeoutInRefreshDelegate_IsReturnedNotThrown()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "token-nobody-has";
+        await using EmailSenderService service = CreateService(CreateBasicOptions(server.Port, requiresAuthentication: false));
+
+        // An HttpClient timeout surfaces as TaskCanceledException (an OperationCanceledException
+        // subclass) even though the caller never canceled - it must be classified as a failure
+        // and returned, not mistaken for caller cancellation and thrown.
+        EmailSenderOptions candidateOptions = CreateOAuth2Options(server.Port, "rejected-token", DateTime.UtcNow.AddMinutes(30),
+            _ => throw new TaskCanceledException("Simulated HttpClient timeout."));
+
+        Exception? exception = await service.TestConnectionAsync(candidateOptions);
+
+        // The original SMTP rejection is the result - the TaskCanceledException is a refresh
+        // failure detail, tolerated and logged, never surfaced as the probe's outcome.
+        Assert.IsType<AuthenticationException>(exception);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithPassedOptions_Canceled_ThrowsInsteadOfReturning()
+    {
+        await using TestSmtpServer server = new();
+        await using EmailSenderService service = CreateService(CreateBasicOptions(server.Port, requiresAuthentication: false));
+        EmailSenderOptions candidateOptions = CreateBasicOptions(server.Port, requiresAuthentication: false);
+
+        using CancellationTokenSource cts = new();
+        cts.Cancel();
+
+        // Caller cancellation is not a probe result - it propagates as an exception.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            async () => await service.TestConnectionAsync(candidateOptions, cts.Token));
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithLiveRuntimeOptionsInstance_ProbesViaRuntimePath()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredBasicPassword = "runtime-password";
+        EmailSenderOptions runtimeOptions = CreateBasicOptions(server.Port, requiresAuthentication: true, password: "runtime-password");
+        await using EmailSenderService service = CreateService(runtimeOptions);
+
+        // Passing the sender's own live options instance must not run the candidate path
+        // (which mutates the supplied instance); it reroutes through the runtime probe.
+        Exception? exception = await service.TestConnectionAsync(runtimeOptions);
+
+        Assert.Null(exception);
+        SmtpSession session = Assert.Single(server.SnapshotSessions());
+        Assert.Equal("runtime-password", session.BasicPassword);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithLiveRuntimeOAuthInstance_HonorsRuntimeRefreshCooldown()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "token-nobody-has";
+
+        int refreshCalls = 0;
+        EmailSenderOptions runtimeOptions = CreateOAuth2Options(server.Port, "expired-token", DateTime.UtcNow.AddMinutes(-5), _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            throw new InvalidOperationException("Token endpoint is down.");
+        });
+        await using EmailSenderService service = CreateService(runtimeOptions);
+
+        // Prime the runtime failure cooldown: the expired token forces one proactive refresh
+        // attempt, whose failure is recorded against the source token.
+        Assert.NotNull(await service.TestConnectionAsync());
+        Assert.Equal(1, Volatile.Read(ref refreshCalls));
+
+        // Passing the LIVE instance must reroute through the runtime machinery, whose cooldown
+        // suppresses another delegate invocation. The candidate path has no cooldown and would
+        // invoke the delegate again - the unchanged count is what pins the reroute.
+        Assert.NotNull(await service.TestConnectionAsync(runtimeOptions));
+        Assert.Equal(1, Volatile.Read(ref refreshCalls));
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithPassedOptions_BrokenRuntimeOptionsSource_StillProbesCandidate()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredBasicPassword = "candidate-password";
+        ThrowingOptionsMonitor monitor = new(CreateBasicOptions(server.Port, requiresAuthentication: false));
+        await using EmailSenderService service = new(monitor, Startup(1), NullLogger<EmailSenderService>.Instance);
+        EmailSenderOptions candidateOptions = CreateBasicOptions(server.Port, requiresAuthentication: true, password: "candidate-password");
+
+        // The runtime source breaks (e.g. a validating reload of invalid config) at the exact
+        // moment candidate settings are being tested to repair it. The live-instance detection
+        // must tolerate the throwing source and probe the candidate on its own merits.
+        monitor.ThrowOnAccess = true;
+
+        Exception? exception = await service.TestConnectionAsync(candidateOptions);
+
+        Assert.Null(exception);
+        SmtpSession session = Assert.Single(server.SnapshotSessions());
+        Assert.Equal("candidate-password", session.BasicPassword);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_RuntimePath_HttpTimeoutInRefreshDelegate_ReturnsOriginalRejection()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "token-nobody-has";
+        EmailSenderOptions runtimeOptions = CreateOAuth2Options(server.Port, "rejected-token", DateTime.UtcNow.AddMinutes(30),
+            _ => throw new TaskCanceledException("Simulated HttpClient timeout."));
+        await using EmailSenderService service = CreateService(runtimeOptions);
+
+        // The token looks valid, so the probe reaches the server and is rejected; the reactive
+        // refresh's TaskCanceledException (an OperationCanceledException thrown while the caller
+        // never canceled) must classify as a refresh failure - the original SMTP rejection is
+        // returned, and nothing escapes to kill callers like the liveness BackgroundService.
+        Exception? exception = await service.TestConnectionAsync();
+
+        Assert.IsType<AuthenticationException>(exception);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_RuntimePath_CanceledDuringRefresh_ThrowsInsteadOfReturning()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "token-nobody-has";
+        using CancellationTokenSource cts = new();
+        EmailSenderOptions runtimeOptions = CreateOAuth2Options(server.Port, "rejected-token", DateTime.UtcNow.AddMinutes(30), _ =>
+        {
+            // The caller cancels while the refresh delegate is in flight.
+            cts.Cancel();
+            cts.Token.ThrowIfCancellationRequested();
+            return ValueTask.FromResult(RefreshResult("unused"));
+        });
+        await using EmailSenderService service = CreateService(runtimeOptions);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            async () => await service.TestConnectionAsync(cts.Token));
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithPassedOAuthOptions_ServerKeepsRejecting_RefreshesExactlyOnce()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "token-nobody-has";
+
+        int refreshCalls = 0;
+        EmailSenderOptions candidateOptions = CreateOAuth2Options(server.Port, "first-token", DateTime.UtcNow.AddMinutes(30), _ =>
+        {
+            Interlocked.Increment(ref refreshCalls);
+            return ValueTask.FromResult(RefreshResult("second-token"));
+        });
+        await using EmailSenderService service = CreateService(CreateBasicOptions(server.Port, requiresAuthentication: false));
+
+        // The refresh keeps succeeding but the server rejects every token: exactly one refresh
+        // and one retry are allowed, then the failure is reported - never a refresh/retry loop.
+        Exception? exception = await service.TestConnectionAsync(candidateOptions);
+
+        Assert.IsType<AuthenticationException>(exception);
+        Assert.Equal(1, Volatile.Read(ref refreshCalls));
+        List<SmtpSession> sessions = server.SnapshotSessions();
+        Assert.Equal(2, sessions.Count);
+        Assert.Equal(["first-token"], sessions[0].OAuthTokens);
+        Assert.Equal(["second-token"], sessions[1].OAuthTokens);
+    }
+
+    [Fact]
+    public async Task TestConnectionAsync_WithPassedOAuthOptions_DoesNotDisturbRuntimeTokenState()
+    {
+        await using TestSmtpServer server = new();
+        server.RequiredOAuthToken = "runtime-token";
+
+        int runtimeRefreshCalls = 0;
+        EmailSenderOptions runtimeOptions = CreateOAuth2Options(server.Port, "runtime-token", DateTime.UtcNow.AddMinutes(30), _ =>
+        {
+            Interlocked.Increment(ref runtimeRefreshCalls);
+            return ValueTask.FromResult(RefreshResult("runtime-refreshed"));
+        });
+        await using EmailSenderService service = CreateService(runtimeOptions);
+
+        Assert.True(await service.TrySendAsync(new EmailMessage("first@example.com", "Subject", "Body")));
+
+        // A foreign candidate is tested (and rejected) in between...
+        EmailSenderOptions candidateOptions = CreateOAuth2Options(server.Port, "candidate-token", DateTime.UtcNow.AddMinutes(30),
+            _ => ValueTask.FromResult(RefreshResult("candidate-refreshed")));
+        Assert.NotNull(await service.TestConnectionAsync(candidateOptions));
+
+        // ...and the runtime sender is untouched: the live options instance keeps its token,
+        // the next send still authenticates with the published runtime token, and the runtime
+        // refresh machinery never ran.
+        Assert.True(await service.TrySendAsync(new EmailMessage("second@example.com", "Subject", "Body")));
+        Assert.Equal("runtime-token", runtimeOptions.AccessToken);
+        Assert.Equal(0, Volatile.Read(ref runtimeRefreshCalls));
+        List<SmtpSession> mailSessions = server.MailSessions();
+        Assert.NotEmpty(mailSessions);
+        Assert.All(mailSessions, static s => Assert.Equal(["runtime-token"], s.OAuthTokens));
     }
 
     [Fact]
@@ -831,6 +1084,26 @@ public sealed class EmailSenderServiceOAuthTests
             refreshAccessTokenAsync: refreshAccessTokenAsync,
             accessToken: accessToken,
             accessTokenExpiresAtUtc: accessTokenExpiresAtUtc);
+}
+
+/// <summary>
+/// An options monitor whose <see cref="CurrentValue"/> can be made to throw on demand,
+/// simulating a validating configuration reload gone bad or a broken custom options source.
+/// </summary>
+internal sealed class ThrowingOptionsMonitor(EmailSenderOptions initialValue) : IOptionsMonitor<EmailSenderOptions>
+{
+    private volatile bool _throwOnAccess;
+
+    public bool ThrowOnAccess { get => _throwOnAccess; set => _throwOnAccess = value; }
+
+    public EmailSenderOptions CurrentValue => _throwOnAccess
+        ? throw new OptionsValidationException(
+            nameof(EmailSenderOptions), typeof(EmailSenderOptions), ["Simulated invalid configuration."])
+        : initialValue;
+
+    public EmailSenderOptions Get(string? name) => CurrentValue;
+
+    public IDisposable? OnChange(Action<EmailSenderOptions, string?> listener) => null;
 }
 
 internal sealed class TestOptionsMonitor<TOptions>(TOptions currentValue) : IOptionsMonitor<TOptions>
