@@ -172,13 +172,7 @@ namespace ReconArt.Email
             SmtpClient[] connections = new SmtpClient[startupConfigurationOptions.MaxConcurrentConnections];
             for (int i = 0; i < connections.Length; i++)
             {
-                SmtpClient client = new();
-                if (startupConfigurationOptions.ServerCertificateValidationCallback is not null)
-                {
-                    client.ServerCertificateValidationCallback = startupConfigurationOptions.ServerCertificateValidationCallback;
-                }
-
-                connections[i] = client;
+                connections[i] = CreateSmtpClient();
             }
 
             _connections = connections;
@@ -199,82 +193,176 @@ namespace ReconArt.Email
         /// <inheritdoc/>
         public async ValueTask<Exception?> TestConnectionAsync(CancellationToken cancellationToken = default)
         {
-            SmtpClient? client = null;
+            EmailSenderOptions? options;
             try
             {
-                EmailSenderOptions? options = await GetOptionsAsync(cancellationToken).ConfigureAwait(false);
-                if (options is null)
+                options = await GetOptionsAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (IsProbeFailure(ex, cancellationToken))
+            {
+                return ex;
+            }
+
+            if (options is null)
+            {
+                return new InvalidOperationException("Email sender is not configured.");
+            }
+
+            // Probe with the same effective credentials the pool would use - the published
+            // snapshot has the current OAuth2 token overlaid, which `options` may not.
+            ConnectionCredentials credentials = Volatile.Read(ref _currentCredentials)!;
+            Debug.Assert(credentials is not null,
+                "A successful options fetch always publishes a credentials snapshot.");
+
+            return await ProbeWithRefreshRetryAsync(options, credentials, useRuntimeRefresh: true, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <inheritdoc/>
+        public ValueTask<Exception?> TestConnectionAsync(EmailSenderOptions options, CancellationToken cancellationToken = default)
+        {
+            // Validated before the async state machine spins up, so the documented
+            // ArgumentNullException surfaces eagerly at the call site instead of being
+            // captured into the returned ValueTask.
+            ArgumentNullException.ThrowIfNull(options);
+
+            return TestCandidateConnectionAsync(options, cancellationToken);
+        }
+
+        private async ValueTask<Exception?> TestCandidateConnectionAsync(EmailSenderOptions options, CancellationToken cancellationToken)
+        {
+            // The static-options constructor registers the caller's instance verbatim, so
+            // "test my current configuration" naturally passes the live runtime options.
+            // Mutating that instance here would race the runtime refresh machinery and
+            // bypass its single-flight gate and cooldown - so the live configuration is
+            // probed through the runtime path instead, which uses the full machinery.
+            EmailSenderOptions? liveOptions = null;
+            if (_mailOptions is not null)
+            {
+                try
                 {
-                    return new InvalidOperationException("Email sender is not configured.");
+                    liveOptions = _mailOptions.CurrentValue;
                 }
-
-                // Probe with the same effective credentials the pool would use - the published
-                // snapshot has the current OAuth2 token overlaid, which `options` may not.
-                ConnectionCredentials credentials = Volatile.Read(ref _currentCredentials)!;
-                Debug.Assert(credentials is not null,
-                    "A successful options fetch always publishes a credentials snapshot.");
-
-                client = new SmtpClient();
-                if (_startupOptions.ServerCertificateValidationCallback is not null)
+                catch
                 {
-                    client.ServerCertificateValidationCallback = _startupOptions.ServerCertificateValidationCallback;
-                }
-
-                bool refreshedAfterFailure = false;
-                while (true)
-                {
-                    Exception? attemptError;
-                    bool shouldRefreshToken;
-                    try
-                    {
-                        await ConnectAndAuthenticateAsync(client, credentials, cancellationToken).ConfigureAwait(false);
-                        return null;
-                    }
-                    catch (Exception ex) when (ex is not OperationCanceledException)
-                    {
-                        // Classify only. All recovery runs below, on a fully unwound stack - never
-                        // inside this catch.
-                        attemptError = ex;
-                        shouldRefreshToken = credentials.AuthenticationType == EmailSenderAuthenticationType.OAuth2
-                            && IsAuthenticationFailure(ex)
-                            && !refreshedAfterFailure;
-                    }
-
-                    if (!shouldRefreshToken)
-                    {
-                        return attemptError;
-                    }
-
-                    // The OAuth2 token was rejected: refresh it once, then retry against a fresh session.
-                    refreshedAfterFailure = true;
-                    if (!await RefreshOAuthTokenAsync(options, credentials.AccessToken, cancellationToken).ConfigureAwait(false))
-                    {
-                        return attemptError;
-                    }
-
-                    RefreshConnectionInfo(options);
-                    credentials = Volatile.Read(ref _currentCredentials) ?? credentials;
-                    await client.DisconnectAsync(quit: true, cancellationToken).ConfigureAwait(false);
+                    // A monitor that cannot produce its current value (e.g. a validating
+                    // reload gone bad) has no live instance to protect - and the runtime
+                    // machinery cannot be racing through it either. Probe the candidate on
+                    // its own merits; the runtime source's problem is not its failure.
                 }
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+
+            if (liveOptions is not null && ReferenceEquals(options, liveOptions))
             {
-                // Every genuine failure is returned to the caller as the result value. The filter
-                // deliberately excludes OperationCanceledException - cancellation is not caught
-                // here or in the loop, so it propagates out and throws, like the rest of the API.
+                return await TestConnectionAsync(cancellationToken).ConfigureAwait(false);
+            }
+
+            try
+            {
+                ObjectValidator.ValidateObjectOrThrow(options);
+            }
+            catch (Exception ex)
+            {
+                // Validation errors are the probe's result, not a throw.
+                return ex;
+            }
+
+            if (options.AuthenticationType == EmailSenderAuthenticationType.OAuth2
+                && !IsTokenUsable(options.AccessToken, options.AccessTokenExpiresAtUtc))
+            {
+                // Failure is tolerated, mirroring the runtime path: the probe proceeds with
+                // whatever token exists and reports the resulting authentication failure.
+                await TryRefreshCandidateOAuthTokenAsync(options, cancellationToken).ConfigureAwait(false);
+            }
+
+            return await ProbeWithRefreshRetryAsync(
+                options, ConnectionCredentials.From(options), useRuntimeRefresh: false, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// The shared probe orchestration behind both <c>TestConnectionAsync</c> overloads:
+        /// one attempt, then - only when an OAuth2 token was rejected - exactly one refresh
+        /// and one retry. A failed refresh reports the original rejection.
+        /// <paramref name="useRuntimeRefresh"/> selects the refresh: the runtime machinery
+        /// (single-flight gate, cooldown, snapshot republication) or the candidate's
+        /// instance-local one.
+        /// </summary>
+        private async ValueTask<Exception?> ProbeWithRefreshRetryAsync(
+            EmailSenderOptions options,
+            ConnectionCredentials credentials,
+            bool useRuntimeRefresh,
+            CancellationToken cancellationToken)
+        {
+            Exception? failure = await ProbeOnceAsync(credentials, cancellationToken).ConfigureAwait(false);
+            if (failure is null || !ShouldRetryWithRefreshedToken(failure, credentials))
+            {
+                return failure;
+            }
+
+            bool refreshed = useRuntimeRefresh
+                ? await TryRefreshRuntimeOAuthTokenAsync(options, credentials.AccessToken, cancellationToken).ConfigureAwait(false)
+                : await TryRefreshCandidateOAuthTokenAsync(options, cancellationToken).ConfigureAwait(false);
+            if (!refreshed)
+            {
+                return failure;
+            }
+
+            ConnectionCredentials retryCredentials = useRuntimeRefresh
+                ? Volatile.Read(ref _currentCredentials)!
+                : ConnectionCredentials.From(options);
+            return await ProbeOnceAsync(retryCredentials, cancellationToken).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// A single connect/authenticate probe attempt against a dedicated, throwaway
+        /// <see cref="SmtpClient"/>, shared by both <c>TestConnectionAsync</c> overloads.
+        /// Failures are returned; only the caller's own cancellation propagates as a throw.
+        /// </summary>
+        private async ValueTask<Exception?> ProbeOnceAsync(ConnectionCredentials credentials, CancellationToken cancellationToken)
+        {
+            SmtpClient client = CreateSmtpClient();
+            try
+            {
+                await ConnectAndAuthenticateAsync(client, credentials, cancellationToken).ConfigureAwait(false);
+                return null;
+            }
+            catch (Exception ex) when (IsProbeFailure(ex, cancellationToken))
+            {
                 return ex;
             }
             finally
             {
-                if (client is not null)
-                {
-                    // Do not pass the cancellation token. We want to disconnect gracefully.
+                // Do not pass the cancellation token. We want to disconnect gracefully.
 #pragma warning disable CA2016 // Forward the 'CancellationToken' parameter to methods
+                if (client.IsConnected)
+                {
                     await client.DisconnectAsync(true).ConfigureAwait(false);
-#pragma warning restore CA2016 // Forward the 'CancellationToken' parameter to methods
-                    client.Dispose();
                 }
+#pragma warning restore CA2016 // Forward the 'CancellationToken' parameter to methods
+                client.Dispose();
             }
+        }
+
+
+        private static bool ShouldRetryWithRefreshedToken(Exception failure, ConnectionCredentials credentials) =>
+            credentials.AuthenticationType == EmailSenderAuthenticationType.OAuth2
+                && IsAuthenticationFailure(failure);
+
+        // Cancellation is not a probe failure and must propagate - but only the CALLER's
+        // cancellation. An OperationCanceledException that arises while the caller's token was
+        // never even canceled (e.g. an HttpClient timeout inside a user refresh delegate
+        // surfaces as TaskCanceledException) is a genuine failure and is returned like any other.
+        private static bool IsProbeFailure(Exception ex, CancellationToken callerToken) =>
+            ex is not OperationCanceledException || !callerToken.IsCancellationRequested;
+
+        private SmtpClient CreateSmtpClient()
+        {
+            SmtpClient client = new();
+            if (_startupOptions.ServerCertificateValidationCallback is not null)
+            {
+                client.ServerCertificateValidationCallback = _startupOptions.ServerCertificateValidationCallback;
+            }
+
+            return client;
         }
 
         /// <inheritdoc/>
@@ -563,10 +651,7 @@ namespace ReconArt.Email
                 MailboxAddress? fromAddress = null;
                 MailboxAddress? senderAddress = null;
 
-                // Whether the send authenticates under an identity we can derive the From header
-                // from. OAuth2 always authenticates; Basic only when RequiresAuthentication is set
-                // (that flag applies to Basic alone). Keying off AuthenticationType keeps this in
-                // lockstep with what Validate() enforces, so the two can never disagree.
+                // Must mirror the branching Validate() uses.
                 bool usesAuthenticatedIdentity =
                     mailOptions.AuthenticationType == EmailSenderAuthenticationType.OAuth2
                     || (mailOptions.AuthenticationType == EmailSenderAuthenticationType.Basic && mailOptions.RequiresAuthentication);
@@ -656,7 +741,8 @@ namespace ReconArt.Email
 
         /// <summary>
         /// Connects (if needed) and authenticates <paramref name="smtpClient"/> for the given
-        /// credential generation. Shared by the pooled send path and <see cref="TestConnectionAsync"/>.
+        /// credential generation. Shared by the pooled send path, <see cref="TestConnectionAsync(CancellationToken)"/>,
+        /// and <see cref="TestConnectionAsync(EmailSenderOptions, CancellationToken)"/>.
         /// Throws on failure; callers classify the exception.
         /// </summary>
         private static async Task ConnectAndAuthenticateAsync(SmtpClient smtpClient, ConnectionCredentials credentials, CancellationToken cancellationToken)
@@ -679,6 +765,67 @@ namespace ReconArt.Email
             {
                 await smtpClient.AuthenticateAsync(credentials.Username ?? string.Empty, credentials.Password ?? string.Empty, cancellationToken)
                     .ConfigureAwait(false);
+            }
+        }
+
+        /// <summary>
+        /// Refreshes the runtime OAuth2 token through the full machinery - single-flight gate,
+        /// cooldown, and token-state publication - and republishes the credentials snapshot.
+        /// Mirrors the tolerant contract of <see cref="TryRefreshCandidateOAuthTokenAsync"/>.
+        /// </summary>
+        private async ValueTask<bool> TryRefreshRuntimeOAuthTokenAsync(
+            EmailSenderOptions options,
+            string? staleAccessToken,
+            CancellationToken cancellationToken)
+        {
+            try
+            {
+                if (!await RefreshOAuthTokenAsync(options, staleAccessToken, cancellationToken).ConfigureAwait(false))
+                {
+                    return false;
+                }
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                // An HttpClient timeout inside the user's refresh delegate, not the caller's
+                // cancellation - already logged by the refresh machinery.
+                return false;
+            }
+
+            RefreshConnectionInfo(options);
+            return true;
+        }
+
+        /// <summary>
+        /// Refreshes the OAuth2 token of a detached candidate options instance, applying the
+        /// result (and firing the persistence callback) on that instance only - never touching
+        /// the sender's own runtime gate, cooldown, or published token overlay.
+        /// </summary>
+        private async ValueTask<bool> TryRefreshCandidateOAuthTokenAsync(EmailSenderOptions options, CancellationToken cancellationToken)
+        {
+            Func<CancellationToken, ValueTask<EmailSenderOAuthRefreshResult>>? refreshAccessTokenAsync = options.RefreshAccessTokenAsync;
+            if (refreshAccessTokenAsync is null)
+            {
+                // Unreachable through validated options; defensive for manually-mutated instances.
+                return false;
+            }
+
+            try
+            {
+                EmailSenderOAuthRefreshResult refreshResult = await refreshAccessTokenAsync(cancellationToken).ConfigureAwait(false);
+                ValidateOAuthRefreshResult(refreshResult);
+                ApplyRefreshResult(options, refreshResult);
+                await InvokeOAuthCredentialsRefreshedAsync(options, refreshResult, cancellationToken).ConfigureAwait(false);
+                return true;
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Could not refresh OAuth2 access token.");
+                return false;
             }
         }
 
@@ -1223,11 +1370,11 @@ namespace ReconArt.Email
 
         private async ValueTask EnsureUsableOAuthTokenAsync(EmailSenderOptions options, CancellationToken cancellationToken)
         {
-            // A default expiry means "unknown", not "expired".
+            // A missing token must be obtained before first use - there is nothing to be
+            // optimistic with. Unknown-expiry semantics live in IsTokenUsable.
             (string? accessToken, DateTime expiresAtUtc) = GetEffectiveOAuthToken(options);
 
-            if (!string.IsNullOrWhiteSpace(accessToken)
-                && (expiresAtUtc == default || expiresAtUtc > DateTime.UtcNow + OAuthTokenExpirySkew))
+            if (IsTokenUsable(accessToken, expiresAtUtc))
             {
                 return;
             }
@@ -1305,19 +1452,12 @@ namespace ReconArt.Email
                 OAuthTokenState refreshedState = new(
                     refreshResult.AccessToken,
                     refreshResult.AccessTokenExpiresAtUtc,
-                    refreshResult.RefreshToken,
                     ReplacedSourceToken: options.AccessToken);
 
                 Volatile.Write(ref _oauthTokenState, refreshedState);
                 Volatile.Write(ref _oauthRefreshFailure, null);
 
-                // Documented contract: refreshed values are applied onto the current options instance.
-                options.AccessToken = refreshResult.AccessToken;
-                options.AccessTokenExpiresAtUtc = refreshResult.AccessTokenExpiresAtUtc;
-                if (refreshResult.RefreshToken is not null)
-                {
-                    options.RefreshToken = refreshResult.RefreshToken;
-                }
+                ApplyRefreshResult(options, refreshResult);
 
                 _logger.LogInformation("OAuth2 access token was refreshed.");
 
@@ -1406,6 +1546,24 @@ namespace ReconArt.Email
                         or SmtpStatusCode.AuthenticationInvalidCredentials
                 };
 
+        // Documented contract: refreshed values are applied onto the supplied options instance.
+        // RefreshToken is only overwritten when the provider actually rotated it.
+        private static void ApplyRefreshResult(EmailSenderOptions options, EmailSenderOAuthRefreshResult refreshResult)
+        {
+            options.AccessToken = refreshResult.AccessToken;
+            options.AccessTokenExpiresAtUtc = refreshResult.AccessTokenExpiresAtUtc;
+            if (refreshResult.RefreshToken is not null)
+            {
+                options.RefreshToken = refreshResult.RefreshToken;
+            }
+        }
+
+        // A default expiry means "unknown", not "expired": the token is used optimistically
+        // and the reactive refresh path corrects us if the server rejects it.
+        private static bool IsTokenUsable(string? accessToken, DateTime expiresAtUtc) =>
+            !string.IsNullOrWhiteSpace(accessToken)
+            && (expiresAtUtc == default || expiresAtUtc > DateTime.UtcNow + OAuthTokenExpirySkew);
+
         private static ParserOptions CreateParserOptions(EmailSenderOptions options) => new()
         {
             AddressParserComplianceMode = options.UseStrictAddressParser ? RfcComplianceMode.Strict : RfcComplianceMode.Loose,
@@ -1467,10 +1625,14 @@ namespace ReconArt.Email
         /// The OAuth2 token generation the service refreshed itself, superseding the token
         /// supplied by the options source until the source presents a different one.
         /// </summary>
+        /// <remarks>
+        /// Deliberately carries no refresh token: the sender never reads one - a rotated
+        /// refresh token is written straight onto the options instance for the consumer's
+        /// delegate, and never participates in any of the sender's own state.
+        /// </remarks>
         private sealed record OAuthTokenState(
             string AccessToken,
             DateTime ExpiresAtUtc,
-            string? RefreshToken,
             string? ReplacedSourceToken);
 
         /// <summary>

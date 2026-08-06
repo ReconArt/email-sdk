@@ -253,6 +253,63 @@ public sealed class DatabaseEmailSenderOptionsMonitor : IOptionsMonitor<EmailSen
 }
 ```
 
+### Testing Candidate Settings
+
+Before publishing candidate settings from a setup screen or external provider, call `TestConnectionAsync(candidateOptions)` with a dedicated candidate `EmailSenderOptions` instance. The overload validates the supplied options and performs a one-off SMTP connect/authentication probe without fetching runtime options or reusing pooled sender connections. For OAuth2 candidates, the access token and expiration can be omitted or expired - the probe refreshes through the candidate's own callbacks before connecting when needed, and refreshes/retries once if the SMTP server rejects the candidate token.
+
+Refreshed values are applied to the candidate instance, and its `OnOAuth2CredentialsRefreshed` callback runs after every successful refresh. **Persist rotated tokens from the callback, not from the test's outcome** - with providers that rotate one-time-use refresh tokens, a refresh can succeed (consuming your stored refresh token) even though the SMTP probe afterwards fails. Gating token persistence on a successful test would strand that rotation and leave an already-consumed refresh token in your store, breaking every subsequent refresh with `invalid_grant`. The transport settings themselves (host, port, username) are what a successful test gates - persist them from the candidate instance afterwards.
+
+```csharp
+string? currentRefreshToken = token.RefreshToken;
+EmailSenderOptions candidateOptions = EmailSenderOptions.CreateOAuth2(
+    host: settings.Host,
+    port: settings.Port,
+    username: settings.Username,
+    accessToken: token.AccessToken,
+    accessTokenExpiresAtUtc: token.ExpiresAtUtc,
+    refreshToken: currentRefreshToken,
+    refreshAccessTokenAsync: async cancellationToken =>
+    {
+        // Always exchange the CURRENT refresh token - with rotating providers, the one we
+        // started with may already have been consumed by an earlier refresh in this test.
+        var refreshed = await tokenProvider.RefreshAsync(currentRefreshToken, cancellationToken);
+        return new EmailSenderOAuthRefreshResult
+        {
+            AccessToken = refreshed.AccessToken,
+            RefreshToken = refreshed.RefreshToken,
+            AccessTokenExpiresAtUtc = refreshed.ExpiresAtUtc
+        };
+    },
+    onOAuth2CredentialsRefreshed: async (refreshed, cancellationToken) =>
+    {
+        currentRefreshToken = refreshed.RefreshToken ?? currentRefreshToken;
+
+        // Persist the rotation IMMEDIATELY - the old refresh token is already consumed at
+        // this point, and the connection test may still fail for unrelated reasons.
+        await settingsStore.SaveTokensAsync(
+            refreshed.AccessToken,
+            currentRefreshToken,
+            refreshed.AccessTokenExpiresAtUtc,
+            cancellationToken);
+    });
+
+Exception? connectionError = await emailSenderService.TestConnectionAsync(candidateOptions, cancellationToken);
+if (connectionError is null)
+{
+    // The candidate works: publish its transport settings together with the final token
+    // state. Persist from candidateOptions, not the original inputs - the probe may have
+    // rotated them.
+    await settingsStore.SaveAsync(
+        candidateOptions.Host,
+        candidateOptions.Port,
+        candidateOptions.Username,
+        candidateOptions.AccessToken,
+        candidateOptions.RefreshToken,
+        candidateOptions.AccessTokenExpiresAtUtc,
+        cancellationToken);
+}
+```
+
 ### Health Monitoring
 
 The `EmailSenderLivenessService` is designed to monitor the health of the email sending process by periodically checking the connection to the SMTP server. It implements Microsoft's `BackgroundService`, allowing it to run in the background and perform health checks.
