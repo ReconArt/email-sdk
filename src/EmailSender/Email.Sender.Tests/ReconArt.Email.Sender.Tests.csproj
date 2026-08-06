@@ -27,6 +27,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Email.Sender\ReconArt.Email.Sender.csproj" />
+    <ProjectReference Include="..\Email.Sender.Identity\ReconArt.Email.Sender.Identity.csproj" />
   </ItemGroup>
 
 </Project>

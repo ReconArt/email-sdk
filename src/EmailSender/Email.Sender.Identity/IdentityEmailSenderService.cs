@@ -26,6 +26,19 @@ namespace ReconArt.Email
         }
 
         /// <summary>
+        /// Initializes a new instance of the <see cref="IdentityEmailSenderService"/> class.
+        /// </summary>
+        /// <param name="optionsProvider">Email sender runtime options provider.</param>
+        /// <param name="startupOptions">Email sender startup options.</param>
+        /// <param name="logger">Email sender logger.</param>
+        public IdentityEmailSenderService(
+            IEmailSenderOptionsProvider optionsProvider,
+            IOptions<EmailSenderStartupOptions> startupOptions,
+            ILogger<EmailSenderService> logger) : base(optionsProvider, startupOptions, logger)
+        {
+        }
+
+        /// <summary>
         /// Creates an instance of <see cref="IdentityEmailSenderService"/>.
         /// </summary>
         /// <param name="mailOptions">Email sender options.</param>

@@ -76,38 +76,39 @@ namespace ReconArt.Email
             Action<EmailSenderStartupOptions>? configureStartupOptions = null)
             where TOptionsSource : class
         {
-            Type optionsSourceType = typeof(TOptionsSource);
-            bool isOptionsMonitor = typeof(IOptionsMonitor<EmailSenderOptions>).IsAssignableFrom(optionsSourceType);
-            bool isOptionsProvider = typeof(IEmailSenderOptionsProvider).IsAssignableFrom(optionsSourceType);
+            return AddEmailSenderServiceWithSource<TOptionsSource>(services, null, configureStartupOptions, null);
+        }
 
-            if (!isOptionsMonitor && !isOptionsProvider)
-            {
-                throw new ArgumentException(
-                    $"{optionsSourceType.FullName} must implement {nameof(IOptionsMonitor<TOptionsSource>)} or {nameof(IEmailSenderOptionsProvider)}.",
-                    nameof(TOptionsSource));
-            }
+        /// <summary>
+        /// Registers an <see cref="IEmailSenderService"/> in the service collection by using a runtime options source,
+        /// loading <see cref="EmailSenderStartupOptions"/> from the supplied configuration.
+        /// </summary>
+        /// <remarks>
+        /// Mail options are supplied at runtime by <typeparamref name="TOptionsSource"/> and are never loaded from
+        /// <paramref name="configuration"/> - only <see cref="EmailSenderStartupOptions"/> are, using the <c>Startup</c>
+        /// child section of <paramref name="sectionName"/> and then overridden by <paramref name="configureStartupOptions"/> (if any).
+        /// </remarks>
+        /// <typeparam name="TOptionsSource">
+        /// Options source type that supplies the current email sender options.
+        /// Must implement <see cref="IOptionsMonitor{TOptions}"/> for <see cref="EmailSenderOptions"/> or <see cref="IEmailSenderOptionsProvider"/>.
+        /// </typeparam>
+        /// <param name="services">Service collection to use.</param>
+        /// <param name="configuration">Configuration to read startup options from.</param>
+        /// <param name="configureStartupOptions">Optional delegate allowing you to override any startup settings loaded from the configuration.</param>
+        /// <param name="sectionName">Section name the <see cref="IEmailSenderService"/> options would be loaded from; startup options use its <c>Startup</c> child section.
+        /// Defaults to <see cref="EmailSenderOptions.SectionName"/>, i.e. startup options load from <see cref="EmailSenderStartupOptions.SectionName"/>.</param>
+        /// <returns>A reference to this instance after the operation has completed.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="configuration"/> is <see langword="null"/>.</exception>
+        public static IServiceCollection AddEmailSenderService<TOptionsSource>(
+            this IServiceCollection services,
+            IConfiguration configuration,
+            Action<EmailSenderStartupOptions>? configureStartupOptions = null,
+            string? sectionName = null)
+            where TOptionsSource : class
+        {
+            ArgumentNullException.ThrowIfNull(configuration);
 
-            services.TryAddSingleton<TOptionsSource>();
-            AddEmailSenderStartupOptions(services, null, configureStartupOptions);
-
-            if (isOptionsProvider)
-            {
-                services.AddSingleton<IEmailSenderOptionsProvider>(static provider =>
-                    (IEmailSenderOptionsProvider)provider.GetRequiredService<TOptionsSource>());
-                services.TryAddSingleton<IEmailSenderService>(static provider =>
-                    new EmailSenderService(
-                        provider.GetRequiredService<IEmailSenderOptionsProvider>(),
-                        provider.GetRequiredService<IOptions<EmailSenderStartupOptions>>(),
-                        provider.GetRequiredService<ILogger<EmailSenderService>>()));
-            }
-            else
-            {
-                services.AddSingleton<IOptionsMonitor<EmailSenderOptions>>(static provider =>
-                    (IOptionsMonitor<EmailSenderOptions>)provider.GetRequiredService<TOptionsSource>());
-                services.TryAddSingleton<IEmailSenderService, EmailSenderService>();
-            }
-
-            return services;
+            return AddEmailSenderServiceWithSource<TOptionsSource>(services, configuration, configureStartupOptions, sectionName);
         }
 
         /// <summary>
@@ -256,6 +257,88 @@ namespace ReconArt.Email
             if (configureOptions is not null)
             {
                 optionsBuilder.Configure(configureOptions);
+            }
+
+            return services;
+        }
+
+        /// <summary>
+        /// Registers a runtime options source for the email sender, along with <see cref="EmailSenderStartupOptions"/>.
+        /// </summary>
+        /// <remarks>
+        /// This exists in the event you want to re-use the runtime options source wiring defined by this library in your own implementation, without registering the service.
+        /// <br/><br/><typeparamref name="TOptionsSource"/> is registered as itself and forwarded to
+        /// <see cref="IEmailSenderOptionsProvider"/> or <see cref="IOptionsMonitor{TOptions}"/> for <see cref="EmailSenderOptions"/>,
+        /// whichever it implements. <see cref="EmailSenderStartupOptions"/> are bound from the <c>Startup</c> child section of
+        /// <paramref name="sectionName"/> when a <paramref name="configuration"/> is supplied, and then overridden by
+        /// <paramref name="configureStartupOptions"/> (if any).
+        /// </remarks>
+        /// <typeparam name="TOptionsSource">
+        /// Options source type that supplies the current email sender options.
+        /// Must implement <see cref="IOptionsMonitor{TOptions}"/> for <see cref="EmailSenderOptions"/> or <see cref="IEmailSenderOptionsProvider"/>.
+        /// </typeparam>
+        /// <param name="services">Service collection to use.</param>
+        /// <param name="configuration">Configuration to read startup options from, if any.</param>
+        /// <param name="configureStartupOptions">Optional delegate allowing you to override any startup settings loaded from the configuration.</param>
+        /// <param name="sectionName">Section name the <see cref="IEmailSenderService"/> options would be loaded from; startup options use its <c>Startup</c> child section.
+        /// Defaults to <see cref="EmailSenderOptions.SectionName"/>, i.e. startup options load from <see cref="EmailSenderStartupOptions.SectionName"/>.</param>
+        /// <returns>A reference to this instance after the operation has completed.</returns>
+        /// <exception cref="ArgumentException"><typeparamref name="TOptionsSource"/> implements neither of the required interfaces.</exception>
+        public static IServiceCollection AddEmailSenderOptionsSource<TOptionsSource>(
+            this IServiceCollection services,
+            IConfiguration? configuration = null,
+            Action<EmailSenderStartupOptions>? configureStartupOptions = null,
+            string? sectionName = null)
+            where TOptionsSource : class
+        {
+            Type optionsSourceType = typeof(TOptionsSource);
+            bool isOptionsMonitor = typeof(IOptionsMonitor<EmailSenderOptions>).IsAssignableFrom(optionsSourceType);
+            bool isOptionsProvider = typeof(IEmailSenderOptionsProvider).IsAssignableFrom(optionsSourceType);
+
+            if (!isOptionsMonitor && !isOptionsProvider)
+            {
+                throw new ArgumentException(
+                    $"{optionsSourceType.FullName} must implement {nameof(IOptionsMonitor<TOptionsSource>)} or {nameof(IEmailSenderOptionsProvider)}.",
+                    nameof(TOptionsSource));
+            }
+
+            services.TryAddSingleton<TOptionsSource>();
+            AddEmailSenderStartupOptions(services, configuration, configureStartupOptions, sectionName);
+
+            if (isOptionsProvider)
+            {
+                services.AddSingleton<IEmailSenderOptionsProvider>(static provider =>
+                    (IEmailSenderOptionsProvider)provider.GetRequiredService<TOptionsSource>());
+            }
+            else
+            {
+                services.AddSingleton<IOptionsMonitor<EmailSenderOptions>>(static provider =>
+                    (IOptionsMonitor<EmailSenderOptions>)provider.GetRequiredService<TOptionsSource>());
+            }
+
+            return services;
+        }
+
+        private static IServiceCollection AddEmailSenderServiceWithSource<TOptionsSource>(
+            IServiceCollection services,
+            IConfiguration? configuration,
+            Action<EmailSenderStartupOptions>? configureStartupOptions,
+            string? sectionName)
+            where TOptionsSource : class
+        {
+            AddEmailSenderOptionsSource<TOptionsSource>(services, configuration, configureStartupOptions, sectionName);
+
+            if (typeof(IEmailSenderOptionsProvider).IsAssignableFrom(typeof(TOptionsSource)))
+            {
+                services.TryAddSingleton<IEmailSenderService>(static provider =>
+                    new EmailSenderService(
+                        provider.GetRequiredService<IEmailSenderOptionsProvider>(),
+                        provider.GetRequiredService<IOptions<EmailSenderStartupOptions>>(),
+                        provider.GetRequiredService<ILogger<EmailSenderService>>()));
+            }
+            else
+            {
+                services.TryAddSingleton<IEmailSenderService, EmailSenderService>();
             }
 
             return services;

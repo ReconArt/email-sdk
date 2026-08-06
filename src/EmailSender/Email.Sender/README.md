@@ -138,8 +138,12 @@ Use `IEmailSenderOptionsProvider` when fetching options requires custom business
 using Microsoft.Extensions.DependencyInjection;
 using ReconArt.Email;
 
-services.AddEmailSenderService<DatabaseEmailSenderOptionsProvider>();
+// Mail options come from the provider; startup options (pool size, queue size,
+// certificate callback) bind from the EmailSender:Startup configuration section.
+services.AddEmailSenderService<DatabaseEmailSenderOptionsProvider>(configuration);
 ```
+
+Omit the configuration argument when startup options should use their defaults, or pass a `configureStartupOptions` delegate to set them in code.
 
 The provider returns `null` while the sender should be treated as unavailable. Sends will fail gracefully until the provider returns a valid `EmailSenderOptions.CreateBasic(...)` or `EmailSenderOptions.CreateOAuth2(...)` instance.
 
