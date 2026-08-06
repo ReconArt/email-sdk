@@ -130,7 +130,7 @@ For OAuth2 scenarios, prefer creating `EmailSenderOptions` in code via `CreateOA
 
 ### Dynamic Runtime Configuration
 
-When SMTP settings are supplied at runtime from a database, cache, secret store, or another external source, register either an `IEmailSenderOptionsProvider` or an `IOptionsMonitor<EmailSenderOptions>`.
+When SMTP settings are supplied at runtime from a database, cache, secret store, or another external source, register an `IEmailSenderOptionsProvider`. Configuration-bound settings already flow through the framework's `IOptionsMonitor<EmailSenderOptions>`.
 
 Use `IEmailSenderOptionsProvider` when fetching options requires custom business logic:
 
@@ -178,89 +178,23 @@ public sealed class DatabaseEmailSenderOptionsProvider : IEmailSenderOptionsProv
 }
 ```
 
-Use `IOptionsMonitor<EmailSenderOptions>` when your application already maintains the current options in memory:
+`IOptionsMonitor<EmailSenderOptions>` is the framework's own reloadable-options shape: when options bind from configuration (`services.AddEmailSenderService(configuration)`), ASP.NET Core builds the monitor and reloads `CurrentValue` on configuration changes - there is nothing to implement. Do not hand-roll an `IOptionsMonitor` for a custom source; that is what `IEmailSenderOptionsProvider` is for. If another component already supplies a monitor implementation, register it directly via `services.AddEmailSenderService<TOptionsSource>()`.
 
-```csharp
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.Extensions.Options;
-using ReconArt.Email;
-
-services.AddEmailSenderService<DatabaseEmailSenderOptionsMonitor>();
-```
-
-The monitor should return a non-null `CurrentValue`. If credentials do not exist yet, return a placeholder `EmailSenderOptions` instance with incomplete transport settings. Sends will fail gracefully until the monitor publishes a valid `EmailSenderOptions.CreateBasic(...)` or `EmailSenderOptions.CreateOAuth2(...)` instance.
-
-`CurrentValue` should be fast and should not synchronously query the database on every send. Load from the database, Redis, or secret store into an in-memory value, replace the whole `EmailSenderOptions` instance when structural SMTP settings change, and notify registered `OnChange` listeners.
-
-For OAuth2, the sender updates `AccessToken`, `AccessTokenExpiresAtUtc`, and `RefreshToken` when a refreshed refresh token is returned. Use `OnOAuth2CredentialsRefreshed` when the application needs to persist or observe those refreshed credentials. Exceptions thrown by user-provided delegates are logged and do not fail the send operation.
-
-```csharp
-public sealed class DatabaseEmailSenderOptionsMonitor : IOptionsMonitor<EmailSenderOptions>
-{
-    private readonly object _lock = new();
-    private readonly List<Action<EmailSenderOptions, string?>> _listeners = [];
-    // Placeholder until real credentials are available; sends fail gracefully until then.
-    private EmailSenderOptions _current = new();
-
-    public EmailSenderOptions CurrentValue
-    {
-        get
-        {
-            lock (_lock)
-            {
-                return _current;
-            }
-        }
-    }
-
-    public EmailSenderOptions Get(string? name) => CurrentValue;
-
-    public IDisposable OnChange(Action<EmailSenderOptions, string?> listener)
-    {
-        lock (_lock)
-        {
-            _listeners.Add(listener);
-        }
-
-        return new Subscription(() =>
-        {
-            lock (_lock)
-            {
-                _listeners.Remove(listener);
-            }
-        });
-    }
-
-    public void Publish(EmailSenderOptions options)
-    {
-        Action<EmailSenderOptions, string?>[] listeners;
-        lock (_lock)
-        {
-            _current = options;
-            listeners = [.. _listeners];
-        }
-
-        foreach (var listener in listeners)
-        {
-            listener(options, Options.DefaultName);
-        }
-    }
-
-    private sealed class Subscription(Action dispose) : IDisposable
-    {
-        public void Dispose() => dispose();
-    }
-}
-```
+For OAuth2, the sender applies refreshed `AccessToken`, `AccessTokenExpiresAtUtc`, and `RefreshToken` values onto the current options instance. Use `OnOAuth2CredentialsRefreshed` when the application needs to persist or observe those refreshed credentials. Exceptions thrown by user-provided delegates are logged and do not fail the send operation.
 
 ### Testing Candidate Settings
 
 Before publishing candidate settings from a setup screen or external provider, call `TestConnectionAsync(candidateOptions)` with a dedicated candidate `EmailSenderOptions` instance. The overload validates the supplied options and performs a one-off SMTP connect/authentication probe without fetching runtime options or reusing pooled sender connections. For OAuth2 candidates, the access token and expiration can be omitted or expired - the probe refreshes through the candidate's own callbacks before connecting when needed, and refreshes/retries once if the SMTP server rejects the candidate token.
 
-Refreshed values are applied to the candidate instance, and its `OnOAuth2CredentialsRefreshed` callback runs after every successful refresh. **Persist rotated tokens from the callback, not from the test's outcome** - with providers that rotate one-time-use refresh tokens, a refresh can succeed (consuming your stored refresh token) even though the SMTP probe afterwards fails. Gating token persistence on a successful test would strand that rotation and leave an already-consumed refresh token in your store, breaking every subsequent refresh with `invalid_grant`. The transport settings themselves (host, port, username) are what a successful test gates - persist them from the candidate instance afterwards.
+Refreshed values are applied onto the candidate instance - read and persist them from it. There is one timing rule, and it only matters for providers that rotate one-time-use refresh tokens: **persist the token values unconditionally after the call, whether or not the test succeeded**. A refresh can succeed - consuming the refresh token in your store - even though the SMTP probe afterwards fails, and gating token persistence on a successful test would strand that rotation, breaking every subsequent refresh with `invalid_grant`. Only the transport settings (host, port, username) are what a successful test vouches for.
+
+As everywhere else, the refresh delegate should read the current refresh token from its source of truth - the store or token library that owns it, as in the examples above. A candidate test is the one exception: the credentials under test come from user input and are not persisted anywhere yet, so a local variable carries them for the duration of the test.
 
 ```csharp
+// The candidate's refresh token has no store row yet - this local is its temporary home,
+// kept current across a mid-test rotation by the callback below.
 string? currentRefreshToken = token.RefreshToken;
+
 EmailSenderOptions candidateOptions = EmailSenderOptions.CreateOAuth2(
     host: settings.Host,
     port: settings.Port,
@@ -270,8 +204,6 @@ EmailSenderOptions candidateOptions = EmailSenderOptions.CreateOAuth2(
     refreshToken: currentRefreshToken,
     refreshAccessTokenAsync: async cancellationToken =>
     {
-        // Always exchange the CURRENT refresh token - with rotating providers, the one we
-        // started with may already have been consumed by an earlier refresh in this test.
         var refreshed = await tokenProvider.RefreshAsync(currentRefreshToken, cancellationToken);
         return new EmailSenderOAuthRefreshResult
         {
@@ -280,35 +212,34 @@ EmailSenderOptions candidateOptions = EmailSenderOptions.CreateOAuth2(
             AccessTokenExpiresAtUtc = refreshed.ExpiresAtUtc
         };
     },
-    onOAuth2CredentialsRefreshed: async (refreshed, cancellationToken) =>
+    onOAuth2CredentialsRefreshed: (refreshed, _) =>
     {
         currentRefreshToken = refreshed.RefreshToken ?? currentRefreshToken;
-
-        // Persist the rotation IMMEDIATELY - the old refresh token is already consumed at
-        // this point, and the connection test may still fail for unrelated reasons.
-        await settingsStore.SaveTokensAsync(
-            refreshed.AccessToken,
-            currentRefreshToken,
-            refreshed.AccessTokenExpiresAtUtc,
-            cancellationToken);
+        return ValueTask.CompletedTask;
     });
 
 Exception? connectionError = await emailSenderService.TestConnectionAsync(candidateOptions, cancellationToken);
+
+// Unconditional, and from the candidate instance: a refresh may have rotated the tokens
+// even when the test failed, and the store's old refresh token is already consumed.
+await settingsStore.SaveTokensAsync(
+    candidateOptions.AccessToken,
+    candidateOptions.RefreshToken,
+    candidateOptions.AccessTokenExpiresAtUtc,
+    cancellationToken);
+
 if (connectionError is null)
 {
-    // The candidate works: publish its transport settings together with the final token
-    // state. Persist from candidateOptions, not the original inputs - the probe may have
-    // rotated them.
+    // The candidate works: publish its transport settings.
     await settingsStore.SaveAsync(
         candidateOptions.Host,
         candidateOptions.Port,
         candidateOptions.Username,
-        candidateOptions.AccessToken,
-        candidateOptions.RefreshToken,
-        candidateOptions.AccessTokenExpiresAtUtc,
         cancellationToken);
 }
 ```
+
+If the application already persists rotations from `OnOAuth2CredentialsRefreshed` (as the runtime examples above do), that hook fires during the candidate test too and covers even a crash mid-probe - the unconditional save then becomes a harmless overwrite of the same values.
 
 ### Health Monitoring
 
